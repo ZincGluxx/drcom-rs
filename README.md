@@ -1,5 +1,6 @@
 # DrCom 校园网助手（Rust 版）
 
+[![Release](https://img.shields.io/github/v/release/ZincGluxx/drcom-rs?style=flat-square&color=blue)](https://github.com/ZincGluxx/drcom-rs/releases/latest)
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B%20%7C%20edition%202024-DEA584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Slint](https://img.shields.io/badge/UI-Slint-23B0BD?style=flat-square)](https://slint.dev/)
 [![Windows](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?style=flat-square&logo=windows&logoColor=white)]()
