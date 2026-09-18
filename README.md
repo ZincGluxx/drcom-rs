@@ -6,6 +6,7 @@
 [![Windows](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?style=flat-square&logo=windows&logoColor=white)]()
 [![Tests](https://img.shields.io/badge/tests-93%20passing-3FB950?style=flat-square)]()
 [![Installer](https://img.shields.io/badge/installer-6.5%20MB-blue?style=flat-square)]()
+[![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey?style=flat-square)](LICENSE)
 
 吉林大学（JLU）校园网 Dr.COM 认证客户端的 **Rust + Slint** 重写版。完整实现
 challenge → login → keep-alive → logout 协议流程，已对真实认证服务器长期实测通过；
@@ -134,6 +135,13 @@ drcom-rs/
   C# + Avalonia 实现与全部开发文档、诊断报告。
 - [jlu-drcom-client](https://github.com/ZincGluxx/jlu-drcom-client) — 四个协议
   世代共八套社区实现的汇总参考。
+
+## 📄 许可
+
+本项目（含本仓库与主仓库的 C# 实现）以
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)（署名—非商业性使用）授权，
+完整文本见 [LICENSE](LICENSE)。使用、修改、分享时请保留作者署名（ZincGlux），
+且不得用于商业目的。
 
 ## ⚠️ 声明
 

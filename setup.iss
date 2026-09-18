@@ -9,7 +9,7 @@
 ; 但同一个 UDP 61440 端口只能被其中一个占用，同时运行时后启动的会报错。
 
 #define MyAppName "DrCom 校园网助手 (Rust)"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "ZincGluxx"
 #define MyAppExeName "drcom-campus.exe"
 #define MyAppCliName "drcom-cli.exe"
