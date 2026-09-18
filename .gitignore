@@ -1,0 +1,14 @@
+# Rust 构建产物
+/target/
+
+# 本地真实配置与日志（可能含真实账号密码，切勿提交）
+drcom.ini
+*.log
+
+# Python 缓存（reference/ 下的校验脚本）
+__pycache__/
+*.pyc
+
+# Inno Setup 编译输出
+Output/
+*.exe

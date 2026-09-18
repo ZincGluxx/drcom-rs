@@ -1,0 +1,69 @@
+[package]
+name = "drcom-campus"
+version = "0.1.2"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-software", "system-tray"] }
+
+# The reference client binds the fixed local port 61440 with SO_REUSEADDR, so
+# `std::net::UdpSocket` is not enough: without reuse the bind fails outright
+# while another Dr.COM component still holds the port.
+socket2 = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Not used directly: this exists so that Cargo's feature unification turns on the
+# `png` codec of the `image` crate, which Slint pulls in through `std`
+# (`i-slint-core/image-decoders`) with no format features at all. Without it the
+# window/tray icons loaded from `@image-url` fail to decode at runtime. The
+# obvious alternative, Slint's own `image-default-formats`, also enables
+# `avif`/`exr`, dragging `ravif`/`rav1e` into the build for no benefit.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Adapter enumeration for the authentication socket: the login frame needs the
+# real adapter's IPv4 address and MAC, and virtual interfaces must be excluded.
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    # MultiByteToWideChar, used to turn the GBK text the authentication server
+    # sends back into something a Chinese Windows user can read.
+    "Win32_Globalization",
+    "Win32_Security_Cryptography",
+    "Win32_System_Registry",
+    # GetLocalTime, for local-time stamps in the on-site event log.
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[build-dependencies]
+slint-build = "=1.17.1"
+
+# Shipping profile. The defaults (no LTO, 16 codegen units, symbols kept) were
+# leaving ~3.5 MB of the GUI binary on the table: Slint compiles to a wide call
+# graph that only fat LTO can collapse across crate boundaries.
+#
+# `strip = true` removes the symbol table only — the icon and version resources
+# come from the `.res` file linked in by `build.rs` and live in the resource
+# section, which stripping does not touch.
+#
+# Not set on purpose:
+#   * `panic = "abort"` would skip destructors on the way out, and Slint removes
+#     the tray icon from `Drop` — aborting would guarantee the orphaned shell
+#     icon this project already had trouble with.
+#   * `opt-level = "s"` trades CPU for size; the polling loops here are latency
+#     sensitive, so `3` stays.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+png = "0.18"
