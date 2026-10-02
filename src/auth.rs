@@ -1,7 +1,7 @@
 //! One Dr.COM UDP challenge exchange. No credentials or login frame are sent.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -77,6 +77,28 @@ pub fn exchange_challenge(
     )
 }
 
+/// Credential-free probe on the socket that will also carry login and keepalive.
+/// Polling bounds cancellation latency without shortening the reply deadline.
+pub fn exchange_challenge_interruptible(
+    transport: &UdpTransport,
+    destination: SocketAddrV4,
+    sequence: u8,
+    nonce: u16,
+    client_option: u8,
+    timeout: Duration,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<ChallengeReceipt, ChallengeExchangeError> {
+    exchange_challenge_from(
+        transport,
+        destination,
+        sequence,
+        nonce,
+        client_option,
+        timeout,
+        Some(stop),
+    )
+}
+
 /// Original proactive logout order at `0x1002ec10`: send a client Ping,
 /// wait 500 ms, then request a fresh challenge. Unlike initial login, the
 /// original logout handler accepts only the current online server IP
@@ -101,7 +123,7 @@ pub fn exchange_logout_challenge(
         nonce,
         client_option,
         timeout,
-        Some(*online_server.ip()),
+        None,
     )
 }
 
@@ -112,8 +134,13 @@ fn exchange_challenge_from(
     nonce: u16,
     client_option: u8,
     timeout: Duration,
-    accepted_source: Option<Ipv4Addr>,
+    stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<ChallengeReceipt, ChallengeExchangeError> {
+    if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(ChallengeExchangeError::Io(io::Error::from(
+            io::ErrorKind::Interrupted,
+        )));
+    }
     transport
         .send(
             destination,
@@ -124,12 +151,21 @@ fn exchange_challenge_from(
     let deadline = Instant::now() + timeout;
     let mut buffer = [0u8; 2048];
     loop {
+        if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(ChallengeExchangeError::Io(io::Error::from(
+                io::ErrorKind::Interrupted,
+            )));
+        }
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|value| !value.is_zero())
             .ok_or(ChallengeExchangeError::TimedOut)?;
         transport
-            .set_read_timeout(Some(remaining))
+            .set_read_timeout(Some(if stop.is_some() {
+                remaining.min(Duration::from_millis(50))
+            } else {
+                remaining
+            }))
             .map_err(ChallengeExchangeError::Io)?;
         let (len, source) = match transport.receive(&mut buffer) {
             Ok(result) => result,
@@ -139,6 +175,9 @@ fn exchange_challenge_from(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
+                if stop.is_some() {
+                    continue;
+                }
                 return Err(ChallengeExchangeError::TimedOut);
             }
             // A latched ICMP error from an earlier datagram says nothing about
@@ -146,9 +185,9 @@ fn exchange_challenge_from(
             Err(error) if crate::transport::is_transient_icmp(&error) => continue,
             Err(error) => return Err(ChallengeExchangeError::Io(error)),
         };
-        if let Some(expected) = accepted_source
-            && source.ip() != expected
-        {
+        // Validate the peer before considering even a rejection. Otherwise a
+        // datagram from an unrelated socket could select or reject an interface.
+        if source != SocketAddr::V4(destination) {
             continue;
         }
         let datagram = &buffer[..len];
@@ -253,6 +292,36 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::thread;
+
+    #[test]
+    fn challenge_and_rejection_from_another_port_cannot_select_an_adapter() {
+        let server = UdpTransport::bind(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let rogue = UdpTransport::bind(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let destination = match server.local_addr().unwrap() {
+            SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+        let worker = thread::spawn(move || {
+            let mut request = [0u8; 64];
+            let (_, client) = server.receive(&mut request).unwrap();
+            let SocketAddr::V4(client) = client else {
+                unreachable!()
+            };
+            let mut reply = vec![0; 0x2c];
+            reply[..4].copy_from_slice(&[2, request[1], request[2], request[3]]);
+            reply[4..8].copy_from_slice(&[1, 2, 3, 4]);
+            rogue.send(client, &[5, 0, 0, 0, 5]).unwrap();
+            rogue.send(client, &reply).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            reply[4..8].copy_from_slice(&[5, 6, 7, 8]);
+            server.send(client, &reply).unwrap();
+        });
+        let client = UdpTransport::bind(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let receipt =
+            exchange_challenge(&client, destination, 2, 1234, 9, Duration::from_secs(1)).unwrap();
+        assert_eq!(receipt.challenge, [5, 6, 7, 8]);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn exchanges_challenge_and_ignores_stale_nonce_on_loopback() {

@@ -36,7 +36,45 @@ impl UdpTransport {
     /// fails outright while any other Dr.COM component still holds the port,
     /// which is the common case when the original client is running.
     pub fn bind(local_ip: Ipv4Addr, local_port: u16) -> io::Result<Self> {
+        Self::bind_interface(local_ip, local_port, None)
+    }
+
+    /// Pin outbound traffic as well as its source address. Used by adapter
+    /// diagnostics to prevent a successful probe through a different NIC.
+    pub fn bind_interface(
+        local_ip: Ipv4Addr,
+        local_port: u16,
+        interface: Option<u32>,
+    ) -> io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        #[cfg(windows)]
+        if let Some(index) = interface {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{
+                IP_UNICAST_IF, IPPROTO_IP, SOCKET_ERROR, WSAGetLastError, setsockopt,
+            };
+            let value = index.to_be();
+            // Windows expects the interface index in network byte order.
+            let status = unsafe {
+                setsockopt(
+                    socket.as_raw_socket() as _,
+                    IPPROTO_IP,
+                    IP_UNICAST_IF,
+                    (&value as *const u32).cast(),
+                    std::mem::size_of::<u32>() as i32,
+                )
+            };
+            if status == SOCKET_ERROR {
+                return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+            }
+        }
+        #[cfg(not(windows))]
+        if interface.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "interface pinning requires Windows",
+            ));
+        }
         socket.set_reuse_address(true)?;
         socket.bind(&SocketAddrV4::new(local_ip, local_port).into())?;
         Ok(Self {

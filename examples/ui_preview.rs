@@ -1,4 +1,8 @@
 //! Render the real UI with synthetic data, without loading credentials or networking.
+//!
+//! Usage: `ui_preview <out.png> [width] [height] [network] [auto|light|dark]`.
+//! The last argument pins the colour scheme, which is the only way to capture the
+//! dark palette on a machine whose Windows theme is light.
 use slint::ComponentHandle;
 slint::include_modules!();
 
@@ -9,6 +13,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width: f32 = std::env::args().nth(2).unwrap_or("520".into()).parse()?;
     let height: f32 = std::env::args().nth(3).unwrap_or("390".into()).parse()?;
     let app = AppWindow::new()?;
+    // 0 = follow the system, 1 = light, 2 = dark (see `Theme.scheme-override`).
+    let scheme = match std::env::args().nth(5).as_deref() {
+        Some("light") => 1,
+        Some("dark") => 2,
+        _ => 0,
+    };
+    app.global::<Theme>().set_scheme_override(scheme);
+    eprintln!(
+        "scheme-override={} dark={} window-background={:?}",
+        app.global::<Theme>().get_scheme_override(),
+        app.global::<Theme>().get_dark(),
+        app.global::<Theme>().get_window_background()
+    );
     app.set_username("示例账号".into());
     app.set_status_detail("网卡已就绪，填写账号后即可连接".into());
     app.set_adapter_name("以太网 · Realtek PCIe GbE".into());

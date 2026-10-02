@@ -1,18 +1,15 @@
 //! Physical adapter selection for the authentication socket.
 //!
 //! The login frame carries the adapter's IPv4 address and MAC, and the socket
-//! binds to that address so authentication traffic cannot leave through a
-//! virtual interface. Hyper-V, VMware, WSL, VPN, TAP and loopback adapters all
+//! binds both that address and the outbound interface. Hyper-V, VMware, WSL,
+//! VPN, TAP and loopback adapters all
 //! appear in the Windows adapter list, so they are filtered out by description
 //! and by requiring an operational status, a usable IPv4 address and a real MAC.
 //!
-//! Ranking follows the reference C# client's `ScoreCandidate`, including its
-//! weights: the interface the OS *would* use to reach the authentication server
-//! dominates, then the presence of a gateway, then the media type. Asking the
-//! routing table first is what keeps a second, unrelated wired NIC from being
-//! chosen just because it is also wired — a guess the old "wired wins" rule
-//! could not avoid. [`select_for`] performs that query; [`select`] is the same
-//! choice without a destination.
+//! The last successfully authenticated adapter GUID is tried first. Remaining
+//! candidates follow the OS route, gateway and media scores. Ranking only sets
+//! the probe order: the session validates a challenge on each candidate before
+//! sending credentials. Every preferred IPv4 address is a separate candidate.
 //!
 //! The preferred-route lookup itself lives in [`crate::route`], because that is
 //! also where the original installs its `/32` route for the same server.
@@ -26,6 +23,8 @@ pub const DEFAULT_MAC: u64 = 0x8888_8888_8888;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterInfo {
+    /// Windows adapter GUID; unlike IfIndex it survives reboot and DHCP changes.
+    pub stable_id: String,
     pub friendly_name: String,
     pub description: String,
     pub ipv4: Ipv4Addr,
@@ -95,10 +94,65 @@ fn score(adapter: &AdapterInfo, preferred_route: Option<u32>) -> u32 {
 /// `destination` is given, the interface the OS would use to reach it is
 /// preferred, which is the signal the original gets from its own route work.
 pub fn select_for(destination: Option<Ipv4Addr>) -> Option<AdapterInfo> {
+    candidates_for(destination).into_iter().next()
+}
+
+/// Ranking is only a probe order; the session must verify a challenge before login.
+pub fn candidates_for(destination: Option<Ipv4Addr>) -> Vec<AdapterInfo> {
     let preferred_route = destination.and_then(route::best_interface_index);
     let mut adapters = list();
-    adapters.sort_by_key(|adapter| std::cmp::Reverse(score(adapter, preferred_route)));
-    adapters.into_iter().next()
+    rank_candidates(
+        &mut adapters,
+        preferred_route,
+        remembered_adapter().as_deref(),
+    );
+    adapters
+}
+
+fn rank_candidates(adapters: &mut [AdapterInfo], route: Option<u32>, remembered: Option<&str>) {
+    adapters.sort_by_key(|adapter| {
+        (
+            std::cmp::Reverse(
+                remembered.is_some_and(|id| id.eq_ignore_ascii_case(&adapter.stable_id)),
+            ),
+            std::cmp::Reverse(score(adapter, route)),
+            adapter.stable_id.clone(),
+            adapter.ipv4,
+        )
+    });
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RememberedAdapter {
+    stable_id: String,
+}
+
+/// Contains only the successful interface GUID, never addresses or credentials.
+pub fn remembered_adapter() -> Option<String> {
+    let path = crate::preferences::data_directory()
+        .ok()?
+        .join("adapter.json");
+    let value: RememberedAdapter = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    (!value.stable_id.is_empty()).then_some(value.stable_id)
+}
+
+pub(crate) fn remember_adapter(adapter: &AdapterInfo) -> std::io::Result<()> {
+    if adapter.stable_id.is_empty() {
+        return Err(std::io::Error::other("网卡缺少稳定标识"));
+    }
+    let directory = crate::preferences::data_directory()?;
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("adapter.json");
+    let temporary = directory.join(format!("adapter.{}.tmp", std::process::id()));
+    let value = RememberedAdapter {
+        stable_id: adapter.stable_id.clone(),
+    };
+    std::fs::write(&temporary, serde_json::to_vec(&value)?)?;
+    let result = crate::preferences::replace(&temporary, &path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Adapters that can carry the campus authentication traffic, best first.
@@ -217,15 +271,15 @@ mod platform {
         while !current.is_null() {
             // SAFETY: `current` walks the list the API wrote into `buffer`,
             // which outlives this loop.
-            if let Some(adapter) = unsafe { read_adapter(current) } {
-                adapters.push(adapter);
+            if let Some(mut found) = unsafe { read_adapter(current) } {
+                adapters.append(&mut found);
             }
             current = unsafe { (*current).Next };
         }
         adapters
     }
 
-    unsafe fn read_adapter(current: *const IP_ADAPTER_ADDRESSES_LH) -> Option<AdapterInfo> {
+    unsafe fn read_adapter(current: *const IP_ADAPTER_ADDRESSES_LH) -> Option<Vec<AdapterInfo>> {
         let adapter = unsafe { &*current };
         if adapter.OperStatus != IF_OPER_STATUS_UP {
             return None;
@@ -244,28 +298,28 @@ mod platform {
         }
         let mac = mac_from_bytes(&adapter.PhysicalAddress[..length])?;
 
-        let mut ipv4 = None;
-        let mut subnet_mask = None;
+        let mut addresses = Vec::new();
         let mut unicast = adapter.FirstUnicastAddress;
         while !unicast.is_null() {
             let entry = unsafe { &*unicast };
             if let Some(address) = unsafe { ipv4_from_socket_address(entry.Address.lpSockaddr) }
                 && usable_ipv4(address)
+                && entry.DadState == 4
             {
-                ipv4 = Some(address);
                 let prefix = entry.OnLinkPrefixLength;
-                if prefix > 0 && prefix <= 32 {
-                    subnet_mask = Some(Ipv4Addr::from(u32::MAX << (32 - prefix)));
+                let mask = if prefix > 0 && prefix <= 32 {
+                    Some(Ipv4Addr::from(u32::MAX << (32 - prefix)))
+                } else {
+                    None
+                };
+                if !addresses.iter().any(|(ip, _)| *ip == address) {
+                    addresses.push((address, mask));
                 }
-                break;
             }
             unicast = entry.Next;
         }
 
-        let mut details = super::NetworkDetails {
-            subnet_mask,
-            ..Default::default()
-        };
+        let mut details = super::NetworkDetails::default();
         let mut unicast = adapter.FirstUnicastAddress;
         while !unicast.is_null() {
             let entry = unsafe { &*unicast };
@@ -293,18 +347,34 @@ mod platform {
             dns = entry.Next;
         }
 
-        Some(AdapterInfo {
-            friendly_name,
-            description,
-            ipv4: ipv4?,
-            mac,
-            is_wireless: adapter.IfType == IF_TYPE_IEEE80211,
-            has_gateway: !adapter.FirstGatewayAddress.is_null(),
-            // `IfIndex` lives in the header's leading union, next to `Length`;
-            // it is the same index the routing APIs report.
-            interface_index: unsafe { adapter.Anonymous1.Anonymous.IfIndex },
-            details,
-        })
+        if adapter.AdapterName.is_null() {
+            return None;
+        }
+        // SAFETY: GetAdaptersAddresses owns a terminated adapter GUID string.
+        let stable_id = unsafe { std::ffi::CStr::from_ptr(adapter.AdapterName.cast()) }
+            .to_string_lossy()
+            .into_owned();
+        Some(
+            addresses
+                .into_iter()
+                .map(|(ipv4, subnet_mask)| AdapterInfo {
+                    stable_id: stable_id.clone(),
+                    friendly_name: friendly_name.clone(),
+                    description: description.clone(),
+                    ipv4,
+                    mac,
+                    is_wireless: adapter.IfType == IF_TYPE_IEEE80211,
+                    has_gateway: !adapter.FirstGatewayAddress.is_null(),
+                    // `IfIndex` lives in the header's leading union, next to `Length`;
+                    // it is the same index the routing APIs report.
+                    interface_index: unsafe { adapter.Anonymous1.Anonymous.IfIndex },
+                    details: super::NetworkDetails {
+                        subnet_mask,
+                        ..details.clone()
+                    },
+                })
+                .collect(),
+        )
     }
 
     unsafe fn ip_from_socket(
@@ -371,6 +441,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remembered_guid_wins_even_when_index_and_dhcp_address_change() {
+        let make = |id: &str, index, ip| AdapterInfo {
+            stable_id: id.into(),
+            friendly_name: "wired".into(),
+            description: "physical".into(),
+            ipv4: ip,
+            mac: 0x1122_3344_5566,
+            is_wireless: false,
+            has_gateway: true,
+            interface_index: index,
+            details: Default::default(),
+        };
+        let mut items = vec![
+            make("other", 1, Ipv4Addr::new(192, 168, 1, 2)),
+            make("CAMPUS", 99, Ipv4Addr::new(49, 140, 1, 3)),
+        ];
+        rank_candidates(&mut items, Some(1), Some("campus"));
+        assert_eq!(items[0].stable_id, "CAMPUS");
+        // An unplugged/replaced remembered adapter must not prevent fallback.
+        rank_candidates(&mut items, Some(1), Some("missing"));
+        assert_eq!(items[0].stable_id, "other");
+        let encoded = serde_json::to_string(&RememberedAdapter {
+            stable_id: "campus".into(),
+        })
+        .unwrap();
+        assert_eq!(encoded, r#"{"stable_id":"campus"}"#);
+    }
+
+    #[test]
     fn virtual_adapters_are_rejected() {
         assert!(looks_virtual(
             "vEthernet (WSL)",
@@ -421,6 +520,7 @@ mod tests {
     #[test]
     fn ranking_prefers_wired_adapters_with_a_gateway() {
         let wired = AdapterInfo {
+            stable_id: "wired".into(),
             friendly_name: "以太网".into(),
             description: "Realtek PCIe GbE Family Controller".into(),
             ipv4: Ipv4Addr::new(10, 100, 61, 20),
@@ -431,6 +531,7 @@ mod tests {
             details: NetworkDetails::default(),
         };
         let wireless = AdapterInfo {
+            stable_id: "wireless".into(),
             friendly_name: "WLAN".into(),
             description: "Intel(R) Wi-Fi 6 AX201".into(),
             ipv4: Ipv4Addr::new(10, 100, 61, 21),
@@ -449,6 +550,7 @@ mod tests {
         // gateway (+300) and media type (+200) combined. That matters because a
         // wireless adapter on the authentication path is still the right one.
         let preferred_wireless = AdapterInfo {
+            stable_id: "wireless".into(),
             friendly_name: "WLAN".into(),
             description: "Intel(R) Wi-Fi 6 AX201".into(),
             ipv4: Ipv4Addr::new(10, 100, 61, 21),
@@ -459,6 +561,7 @@ mod tests {
             details: NetworkDetails::default(),
         };
         let idle_wired = AdapterInfo {
+            stable_id: "wired".into(),
             friendly_name: "以太网 2".into(),
             description: "Realtek PCIe GbE Family Controller".into(),
             ipv4: Ipv4Addr::new(192, 168, 1, 20),

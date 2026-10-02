@@ -125,7 +125,7 @@ fn crypt(bytes: &[u8], protect: bool) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -154,7 +154,7 @@ fn crypt(_: &[u8], _: bool) -> io::Result<Vec<u8>> {
     ))
 }
 #[cfg(not(windows))]
-fn replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 

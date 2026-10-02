@@ -24,6 +24,15 @@ fn main() -> Result<(), slint::PlatformError> {
     };
 
     let app = AppWindow::new()?;
+    // The window follows the Windows app theme by default; `DRCOM_THEME` pins it
+    // instead (0 = auto, 1 = light, 2 = dark), for users whose desktop reports the
+    // wrong scheme and for capturing screenshots of both palettes.
+    let scheme_override = match std::env::var("DRCOM_THEME").as_deref() {
+        Ok("light") => 1,
+        Ok("dark") => 2,
+        _ => 0,
+    };
+    app.global::<Theme>().set_scheme_override(scheme_override);
     let tray = AppTray::new()?;
     let backend = std::rc::Rc::new(ui_backend::Backend::attach(&app, &tray));
     let timer = slint::Timer::default();
@@ -74,6 +83,87 @@ fn main() -> Result<(), slint::PlatformError> {
     app.show()?;
     tray.show()?;
     slint::run_event_loop()
+}
+
+#[cfg(test)]
+mod theme_tests {
+    //! The window paints its own surfaces instead of using the style's, so a broken
+    //! dark mode does not crash anything — it just makes the text unreadable. These
+    //! checks pin the contract rather than the exact colours: both schemes resolve,
+    //! the text keeps a readable contrast against the surface behind it, and the two
+    //! schemes are actually different.
+
+    use super::{AppWindow, Theme};
+    use slint::ComponentHandle;
+
+    /// WCAG 2.1 contrast ratio between two opaque colours.
+    fn contrast(a: slint::Color, b: slint::Color) -> f64 {
+        fn luminance(colour: slint::Color) -> f64 {
+            let channel = |value: u8| {
+                let value = f64::from(value) / 255.0;
+                if value <= 0.039_28 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(colour.red())
+                + 0.7152 * channel(colour.green())
+                + 0.0722 * channel(colour.blue())
+        }
+        let (one, other) = (luminance(a), luminance(b));
+        let (lighter, darker) = if one > other {
+            (one, other)
+        } else {
+            (other, one)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn both_colour_schemes_keep_the_text_readable() {
+        let Ok(app) = AppWindow::new() else {
+            eprintln!("skipped: no windowing backend available to build the component on");
+            return;
+        };
+        let theme = app.global::<Theme>();
+        let mut surfaces = Vec::new();
+        for (scheme, name) in [(1, "light"), (2, "dark")] {
+            theme.set_scheme_override(scheme);
+            let surface = theme.get_surface_background();
+            surfaces.push(surface);
+            for (label, colour) in [
+                ("heading", theme.get_heading_text()),
+                ("body", theme.get_body_text()),
+                ("muted", theme.get_muted_text()),
+                ("accent", theme.get_accent()),
+            ] {
+                let ratio = contrast(surface, colour);
+                assert!(
+                    ratio >= 4.5,
+                    "{name} scheme: {label} text only reaches {ratio:.2}:1 on the card surface"
+                );
+            }
+            let hero = contrast(theme.get_hero_background(), theme.get_heading_text());
+            assert!(
+                hero >= 4.5,
+                "{name} scheme: hero heading only reaches {hero:.2}:1"
+            );
+            // The status dot in the hero card is the one colour that has to stay
+            // legible on the hero fill and still read as "connected".
+            let online = contrast(theme.get_hero_background(), theme.get_online_text());
+            assert!(
+                online >= 4.5,
+                "{name} scheme: online indicator only reaches {online:.2}:1"
+            );
+        }
+        // A dark scheme that resolves to the light palette would pass every contrast
+        // check above and still be broken.
+        assert_ne!(
+            surfaces[0], surfaces[1],
+            "the dark scheme paints the same card surface as the light one"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -69,6 +69,7 @@ pub enum SessionPhase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     Phase(SessionPhase),
+    AdapterSelected(crate::adapter::AdapterInfo),
     Note(String),
     KeepAliveCycle { sequence: u8, tail: [u8; 4] },
 }
@@ -181,6 +182,11 @@ impl From<io::Error> for SessionError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConfig {
+    /// Discover and challenge physical interfaces before sending credentials.
+    pub auto_adapter: bool,
+    pub interface_index: Option<u32>,
+    /// Explicit MAC configuration remains authoritative after discovery.
+    pub adapter_mac_override: Option<u64>,
     /// Authentication servers in priority order.
     pub servers: Vec<Ipv4Addr>,
     pub server_port: u16,
@@ -228,6 +234,9 @@ pub struct SessionConfig {
 impl SessionConfig {
     pub fn new(servers: Vec<Ipv4Addr>, username: Vec<u8>, password: Vec<u8>) -> Self {
         Self {
+            auto_adapter: false,
+            interface_index: None,
+            adapter_mac_override: None,
             servers,
             server_port: crate::transport::DEFAULT_LOCAL_PORT,
             local_ipv4: Ipv4Addr::UNSPECIFIED,
@@ -272,6 +281,8 @@ pub struct LoginSession {
     server: Option<SocketAddrV4>,
     stop: Arc<AtomicBool>,
     connected_since: Option<Instant>,
+    selected_adapter: Option<crate::adapter::AdapterInfo>,
+    failed_adapters: Vec<(String, Ipv4Addr)>,
 }
 
 impl LoginSession {
@@ -293,6 +304,8 @@ impl LoginSession {
             server: None,
             stop: Arc::new(AtomicBool::new(false)),
             connected_since: None,
+            selected_adapter: None,
+            failed_adapters: Vec::new(),
         })
     }
 
@@ -328,9 +341,18 @@ impl LoginSession {
     fn open(&mut self) -> Result<(), SessionError> {
         if self.transport.is_none() {
             let bind_ip = self.config.bind_ipv4.unwrap_or(self.config.local_ipv4);
-            let transport = UdpTransport::bind(bind_ip, self.config.local_port)?;
+            let transport = UdpTransport::bind_interface(
+                bind_ip,
+                self.config.local_port,
+                self.config.interface_index,
+            )?;
             transport.set_read_timeout(Some(self.config.request_timeout))?;
             self.transport = Some(transport);
+            if let Some(index) = self.config.interface_index {
+                self.selected_adapter = crate::adapter::list()
+                    .into_iter()
+                    .find(|a| a.interface_index == index && a.ipv4 == self.config.local_ipv4);
+            }
         }
         Ok(())
     }
@@ -434,6 +456,18 @@ impl LoginSession {
         &mut self,
         events: &mut dyn FnMut(SessionEvent),
     ) -> Result<ChallengeReceipt, SessionError> {
+        if self.config.auto_adapter && self.transport.is_none() {
+            let candidates = crate::adapter::candidates_for(self.config.servers.first().copied())
+                .into_iter()
+                .filter(|a| {
+                    !self
+                        .failed_adapters
+                        .iter()
+                        .any(|(id, ip)| id == &a.stable_id && ip == &a.ipv4)
+                })
+                .collect();
+            return self.discover_adapter(candidates, events);
+        }
         self.open()?;
         let server_port = self.config.server_port;
         let timeout = self.config.request_timeout;
@@ -464,6 +498,15 @@ impl LoginSession {
                 SessionError::Transport(error.kind())
             }
         })?;
+        self.accept_challenge(&challenge, events);
+        Ok(challenge)
+    }
+
+    fn accept_challenge(
+        &mut self,
+        challenge: &ChallengeReceipt,
+        events: &mut dyn FnMut(SessionEvent),
+    ) {
         // Only the server that answered is accepted from now on.
         self.server = match challenge.source {
             SocketAddr::V4(address) => Some(address),
@@ -476,18 +519,151 @@ impl LoginSession {
             self.sequence,
             challenge.source
         )));
-        Ok(challenge)
+    }
+
+    fn discover_adapter(
+        &mut self,
+        candidates: Vec<crate::adapter::AdapterInfo>,
+        events: &mut dyn FnMut(SessionEvent),
+    ) -> Result<ChallengeReceipt, SessionError> {
+        if candidates.is_empty() {
+            return Err(SessionError::NoResponse("未检测到可用的物理网卡"));
+        }
+        for candidate in candidates {
+            if self.stopped() {
+                return Err(SessionError::Stopped);
+            }
+            events(SessionEvent::Note(format!(
+                "检测网卡 {}（{}）",
+                candidate.friendly_name, candidate.ipv4
+            )));
+            // Tests use loopback without Windows interface pinning. Production
+            // candidates always carry a real, nonzero index.
+            let index = (candidate.interface_index != 0).then_some(candidate.interface_index);
+            let transport =
+                match UdpTransport::bind_interface(candidate.ipv4, self.config.local_port, index) {
+                    Ok(value) => value,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+                        ) =>
+                    {
+                        return Err(error.into());
+                    }
+                    Err(error) => {
+                        events(SessionEvent::Note(format!(
+                            "网卡 {} 无法绑定：{error}",
+                            candidate.friendly_name
+                        )));
+                        continue;
+                    }
+                };
+            for server in self.config.servers.clone() {
+                if self.stopped() {
+                    return Err(SessionError::Stopped);
+                }
+                self.sequence = self.sequence.wrapping_add(1);
+                let result = auth::exchange_challenge_interruptible(
+                    &transport,
+                    SocketAddrV4::new(server, self.config.server_port),
+                    self.sequence,
+                    reference_login::challenge_nonce(unix_seconds()),
+                    CHALLENGE_CLIENT_OPTION,
+                    self.config.request_timeout,
+                    &self.stop,
+                );
+                match result {
+                    Ok(challenge) => {
+                        self.config.local_ipv4 = candidate.ipv4;
+                        self.config.interface_index = index;
+                        self.config.mac = self.config.adapter_mac_override.unwrap_or(candidate.mac);
+                        self.retry.select_server(server);
+                        self.transport = Some(transport);
+                        self.selected_adapter = Some(candidate.clone());
+                        events(SessionEvent::AdapterSelected(candidate));
+                        self.accept_challenge(&challenge, events);
+                        return Ok(challenge);
+                    }
+                    Err(ChallengeExchangeError::Rejected) => {
+                        return Err(SessionError::Challenge("服务器拒绝了挑战请求"));
+                    }
+                    Err(ChallengeExchangeError::Io(error))
+                        if error.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        return Err(SessionError::Stopped);
+                    }
+                    Err(error) => events(SessionEvent::Note(format!(
+                        "该网卡未收到 {server} 的有效挑战回复：{error:?}"
+                    ))),
+                }
+            }
+        }
+        Err(SessionError::NoResponse("所有物理网卡均未收到有效挑战回复"))
     }
 
     /// Full login: challenge, login frame, response handling and retries.
     pub fn login(&mut self, events: &mut dyn FnMut(SessionEvent)) -> Result<(), SessionError> {
-        let reference = self.reference_config();
+        loop {
+            match self.login_on_adapter(events) {
+                Err(error) if self.advance_adapter(&error, events)? => continue,
+                outcome => return outcome,
+            }
+        }
+    }
+
+    fn advance_adapter(
+        &mut self,
+        error: &SessionError,
+        events: &mut dyn FnMut(SessionEvent),
+    ) -> Result<bool, SessionError> {
+        let unreachable = matches!(
+            error,
+            SessionError::NoResponse(_)
+                | SessionError::Transport(
+                    io::ErrorKind::NetworkUnreachable
+                        | io::ErrorKind::NetworkDown
+                        | io::ErrorKind::AddrNotAvailable
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::NotConnected
+                )
+        );
+        if !self.config.auto_adapter || !unreachable {
+            return Ok(false);
+        }
+        let Some(adapter) = self.selected_adapter.take() else {
+            return Ok(false);
+        };
+        events(SessionEvent::Note(format!(
+            "网卡 {} 认证无响应，尝试其他物理网卡",
+            adapter.friendly_name
+        )));
+        self.failed_adapters.push((adapter.stable_id, adapter.ipv4));
+        self.transport = None;
+        self.server = None;
+        self.retry = if self.config.allow_loopback_server {
+            LoginRetry::new_accepting_loopback(self.config.servers.clone())?
+        } else {
+            LoginRetry::new(self.config.servers.clone())?
+        };
+        Ok(true)
+    }
+
+    fn login_on_adapter(
+        &mut self,
+        events: &mut dyn FnMut(SessionEvent),
+    ) -> Result<(), SessionError> {
         loop {
             if self.stopped() {
                 return Err(SessionError::Stopped);
             }
             events(SessionEvent::Phase(SessionPhase::Challenge));
             self.request_challenge(events)?;
+            if self.stopped() {
+                return Err(SessionError::Stopped);
+            }
+            // Discovery can change IPv4/MAC; construct the frame afterwards.
+            let reference = self.reference_config();
             let server = self.active_server()?;
 
             events(SessionEvent::Phase(SessionPhase::Authenticating));
@@ -518,6 +694,19 @@ impl LoginSession {
                 LoginResponse::Success(success) => {
                     self.cookie = success.session_cookie;
                     self.connected_since = Some(Instant::now());
+                    if !self.config.allow_loopback_server
+                        && let Some(adapter) = &self.selected_adapter
+                    {
+                        match crate::adapter::remember_adapter(adapter) {
+                            Ok(()) => events(SessionEvent::Note(format!(
+                                "已记住可认证网卡 {}，以后优先使用",
+                                adapter.friendly_name
+                            ))),
+                            Err(error) => events(SessionEvent::Note(format!(
+                                "已连接，但保存首选网卡失败：{error}"
+                            ))),
+                        }
+                    }
                     events(SessionEvent::Note(format!(
                         "认证成功，会话尾码 {}",
                         hex(&success.session_cookie)
@@ -995,6 +1184,8 @@ mod tests {
         ElevenCycles,
         /// Never answer.
         Silent,
+        /// Simulate an unrelated wired network on the first source address.
+        IgnoreFirstAdapter,
     }
 
     fn challenge_reply(sequence: u8, nonce: u16) -> Vec<u8> {
@@ -1047,6 +1238,12 @@ mod tests {
                     continue;
                 };
                 let datagram = buffer[..length].to_vec();
+                if matches!(behaviour, Behaviour::IgnoreFirstAdapter)
+                    && source.ip() == Ipv4Addr::new(127, 0, 0, 2)
+                {
+                    seen.push(datagram);
+                    continue;
+                }
                 let Some(client) = (match source {
                     SocketAddr::V4(address) => Some(address),
                     SocketAddr::V6(_) => None,
@@ -1150,6 +1347,151 @@ mod tests {
         config.keepalive_retries = 2;
         config.allow_loopback_server = true;
         config
+    }
+
+    fn fake_adapter(ip: Ipv4Addr, id: &str) -> crate::adapter::AdapterInfo {
+        crate::adapter::AdapterInfo {
+            stable_id: id.into(),
+            friendly_name: id.into(),
+            description: "test".into(),
+            ipv4: ip,
+            mac: 0x1122_8877_6655,
+            is_wireless: false,
+            has_gateway: true,
+            interface_index: 0,
+            details: Default::default(),
+        }
+    }
+
+    #[test]
+    fn silent_adapter_falls_back_before_any_credentials_are_sent() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let server = spawn_mock(Behaviour::IgnoreFirstAdapter, Arc::clone(&stop), tx);
+        let mut config = session_config(server.port());
+        config.request_timeout = Duration::from_millis(100);
+        let mut session = LoginSession::new(config).unwrap();
+        session
+            .discover_adapter(
+                vec![
+                    fake_adapter(Ipv4Addr::new(127, 0, 0, 2), "silent"),
+                    fake_adapter(Ipv4Addr::LOCALHOST, "campus"),
+                ],
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(session.config.local_ipv4, Ipv4Addr::LOCALHOST);
+        let local = session.transport().unwrap().local_addr().unwrap();
+        session.login(&mut |_| {}).unwrap();
+        assert_eq!(
+            session.transport().unwrap().local_addr().unwrap(),
+            local,
+            "login must reuse the verified socket"
+        );
+        assert!(session.connected_for().is_some());
+        stop.store(true, Ordering::Relaxed);
+        let packets = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(packets[0][0], 1, "first interface only sends a challenge");
+        let login = packets.iter().find(|p| p[0] == 3).unwrap();
+        assert_eq!(
+            login,
+            &reference_login::build_login_packet(
+                &SALT,
+                b"testuser",
+                b"testpass",
+                &session.reference_config()
+            )
+            .unwrap(),
+            "login frame must report the verified interface's IP/MAC"
+        );
+    }
+
+    #[test]
+    fn rejected_login_keeps_verified_adapter_and_does_not_try_another() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, _) = mpsc::channel();
+        let server = spawn_mock(Behaviour::RejectLogin, Arc::clone(&stop), tx);
+        let mut session = LoginSession::new(session_config(server.port())).unwrap();
+        let mut selected = Vec::new();
+        session
+            .discover_adapter(
+                vec![
+                    fake_adapter(Ipv4Addr::LOCALHOST, "first"),
+                    fake_adapter(Ipv4Addr::new(127, 0, 0, 2), "second"),
+                ],
+                &mut |event| {
+                    if let SessionEvent::AdapterSelected(a) = event {
+                        selected.push(a.stable_id);
+                    }
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            session.login(&mut |_| {}),
+            Err(SessionError::Rejected(_))
+        ));
+        assert_eq!(selected, vec!["first"]);
+        assert_eq!(
+            session.selected_adapter.as_ref().unwrap().stable_id,
+            "first"
+        );
+        assert!(session.connected_since.is_none());
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stopping_discovery_does_not_wait_for_the_full_server_timeout() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, _) = mpsc::channel();
+        let server = spawn_mock(Behaviour::Silent, Arc::clone(&stop), tx);
+        let mut config = session_config(server.port());
+        config.request_timeout = Duration::from_secs(5);
+        let mut session = LoginSession::new(config).unwrap();
+        session.use_external_stop(Arc::clone(&stop));
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            stop.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            session
+                .discover_adapter(vec![fake_adapter(Ipv4Addr::LOCALHOST, "one")], &mut |_| {})
+                .unwrap_err(),
+            SessionError::Stopped
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(session.transport.is_none());
+    }
+
+    #[test]
+    fn only_network_failure_advances_an_automatic_adapter() {
+        let mut config = session_config(61440);
+        config.auto_adapter = true;
+        let mut session = LoginSession::new(config).unwrap();
+        session.selected_adapter = Some(fake_adapter(Ipv4Addr::LOCALHOST, "campus"));
+        // A rejection is a terminal authentication result, even if another
+        // interface is available. Do not try credentials across interfaces.
+        let failure = login_response::parse(&[5, 0, 0, 0, 5]);
+        let LoginResponse::Failure(failure) = failure else {
+            panic!("invalid fixture")
+        };
+        assert!(
+            !session
+                .advance_adapter(&SessionError::Rejected(failure), &mut |_| {})
+                .unwrap()
+        );
+        assert!(session.failed_adapters.is_empty());
+        assert!(
+            session
+                .advance_adapter(&SessionError::NoResponse("登录"), &mut |_| {})
+                .unwrap()
+        );
+        assert_eq!(
+            session.failed_adapters,
+            vec![("campus".into(), Ipv4Addr::LOCALHOST)]
+        );
+        assert!(session.selected_adapter.is_none());
+        assert!(session.transport.is_none());
     }
 
     #[test]

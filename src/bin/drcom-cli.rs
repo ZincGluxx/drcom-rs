@@ -71,7 +71,7 @@ struct Args {
     user: String,
     pass: String,
     local_ip: Option<Ipv4Addr>,
-    mac: u64,
+    mac: Option<u64>,
     hostname: String,
     dns: Ipv4Addr,
     dhcp: Ipv4Addr,
@@ -265,7 +265,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         user,
         pass,
         local_ip,
-        mac: mac.unwrap_or(adapter::DEFAULT_MAC),
+        mac,
         hostname,
         dns,
         dhcp,
@@ -302,7 +302,10 @@ fn parse_mac(text: &str) -> Result<u64, String> {
 
 fn run(args: Args) -> Result<(), SessionError> {
     let stop = Arc::new(AtomicBool::new(false));
-    let selected = adapter::select_for(args.servers.first().copied());
+    let selected = match args.local_ip {
+        Some(ip) => adapter::list().into_iter().find(|a| a.ipv4 == ip),
+        None => adapter::select_for(args.servers.first().copied()),
+    };
     if let Some(found) = &selected {
         println!(
             "网卡 {} ({})  IPv4 {}  MAC {:012x}  IF {}",
@@ -322,7 +325,22 @@ fn run(args: Args) -> Result<(), SessionError> {
         .or_else(|| selected.as_ref().map(|a| a.ipv4))
         .unwrap_or(Ipv4Addr::UNSPECIFIED);
     config.hostname = args.hostname.clone().into_bytes();
-    config.mac = args.mac;
+    config.auto_adapter = args.local_ip.is_none();
+    config.interface_index = selected
+        .as_ref()
+        .filter(|a| a.ipv4 == config.local_ipv4)
+        .map(|a| a.interface_index);
+    if let Some(ip) = args.local_ip {
+        config.interface_index = adapter::list()
+            .into_iter()
+            .find(|a| a.ipv4 == ip)
+            .map(|a| a.interface_index);
+    }
+    config.adapter_mac_override = args.mac;
+    config.mac = args
+        .mac
+        .or_else(|| selected.as_ref().map(|a| a.mac))
+        .unwrap_or(adapter::DEFAULT_MAC);
     config.primary_dns = args.dns.octets();
     config.dhcp_server = args.dhcp.octets();
     config.auth_route = args.auth_route;
@@ -437,6 +455,9 @@ impl Reporter {
 
     fn handle(&mut self, event: SessionEvent) {
         match event {
+            SessionEvent::AdapterSelected(found) => {
+                println!("已验证网卡 {}（{}）", found.friendly_name, found.ipv4);
+            }
             SessionEvent::Phase(phase) => {
                 if self.last_phase == Some(phase) {
                     return;

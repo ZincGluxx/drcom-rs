@@ -703,6 +703,9 @@ impl Backend {
         );
         config.local_ipv4 = found.ipv4;
         config.mac = found.mac;
+        config.auto_adapter = self.settings.local_ip.is_none();
+        config.interface_index = Some(found.interface_index);
+        config.adapter_mac_override = self.settings.mac;
         config.hostname = host_name().into_bytes();
         apply_settings(&mut config, &self.settings);
         config.allow_loopback_server = false;
@@ -773,12 +776,14 @@ impl Backend {
                     backend.finish(Err(drcom_campus::session::SessionError::Stopped));
                     break;
                 }
-                // Re-read the interface after a link change instead of binding
-                // every retry to an address that may no longer exist.
-                if let Some(found) = adapter::select_for(config.servers.first().copied()) {
-                    config.local_ipv4 = backend.settings.local_ip.unwrap_or(found.ipv4);
-                    config.mac = backend.settings.mac.unwrap_or(found.mac);
-                    backend.show_session_adapter(&found);
+                // Automatic sessions discover again inside the session, using
+                // the last successfully authenticated GUID as first candidate.
+                // A manually configured address remains fixed.
+                if let Some(ip) = backend.settings.local_ip {
+                    config.interface_index = adapter::list()
+                        .into_iter()
+                        .find(|found| found.ipv4 == ip)
+                        .map(|found| found.interface_index);
                 }
             }
         });
@@ -786,6 +791,7 @@ impl Backend {
 
     fn on_event(&self, event: SessionEvent) {
         match event {
+            SessionEvent::AdapterSelected(found) => self.show_session_adapter(&found),
             SessionEvent::Phase(phase) => match phase {
                 SessionPhase::Challenge => self.set_connection("连接中", "正在请求挑战…"),
                 SessionPhase::Authenticating => self.set_connection("连接中", "正在认证…"),

@@ -63,6 +63,14 @@ impl LoginRetry {
         self.servers[self.active_index]
     }
 
+    /// Start the login budget on the server verified by the adapter probe.
+    pub(crate) fn select_server(&mut self, server: Ipv4Addr) {
+        if let Some(index) = self.servers.iter().position(|value| *value == server) {
+            self.active_index = index;
+            self.sends_on_active_server = 1;
+        }
+    }
+
     pub fn on_login_timeout(&mut self) -> LoginTimeout {
         if self.sends_on_active_server < MAX_LOGIN_SENDS_PER_SERVER {
             self.sends_on_active_server += 1;

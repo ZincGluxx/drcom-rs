@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B%20%7C%20edition%202024-DEA584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Slint](https://img.shields.io/badge/UI-Slint-23B0BD?style=flat-square)](https://slint.dev/)
 [![Windows](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?style=flat-square&logo=windows&logoColor=white)]()
-[![Tests](https://img.shields.io/badge/tests-93%20passing-3FB950?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/tests-100%20passing-3FB950?style=flat-square)]()
 [![Installer](https://img.shields.io/badge/installer-6.5%20MB-blue?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey?style=flat-square)](LICENSE)
 
@@ -24,10 +24,14 @@ challenge → login → keep-alive → logout 协议流程，已对真实认证�
 - 完整 Dr.COM 认证流程，逐字节对应经过实战检验的 B 世代 Python 参考实现。
 - 心跳保活自动协商，长时间在线不掉线（实测连续保活 7.5 小时无空档、零失败）。
 - 支持多认证服务器地址依次尝试；可选登录前添加认证服务器 /32 主机路由。
+- 登录前逐网卡验证认证挑战，绑定源 IP 和出接口，并核对服务器地址、端口、序号及 nonce。
+- 登录成功后记住网卡 GUID，重启与重连优先使用；失效后自动探测其他物理网卡。账号密码被拒绝时停止尝试。
 
 **界面与系统集成**
 
 - 单窗口紧凑布局：账号设置 + 网络概览 + 双栈体检，状态一目了然。
+- 跟随 Windows 浅色 / 暗色主题实时切换（切换系统主题无需重启程序）；需要固定配色时
+  用环境变量 `DRCOM_THEME=light`（或 `dark`）覆盖。
 - 关闭窗口最小化到托盘，托盘菜单连接 / 下线 / 退出；单实例保护（重复启动会唤醒已运行实例）。
 - 自动登录、自动重连、开机自启；凭据用 Windows DPAPI 加密保存，不落明文。
 
@@ -64,7 +68,7 @@ challenge → login → keep-alive → logout 协议流程，已对真实认证�
 用于编译图标资源；`build.rs` 会自动定位）、[Inno Setup 6](https://jrsoftware.org/isinfo.php)（仅打包需要）。
 
 ```bash
-# 运行测试（基线：78 项库测试 + 15 项集成测试）
+# 运行测试（84 项库测试 + 16 项 GUI 测试）
 cargo test --offline
 
 # 构建 GUI 与 CLI
@@ -114,7 +118,7 @@ drcom-cli --user 20230001 --pass secret
   动态构造，参考向量固化在 `reference/` 下并由测试钉住。
 - `reference/` 同时提供生成 / 校验向量的 Python 脚本，可独立复核协议实现。
 - 测试覆盖：协议帧构造、配置解析（含错误行号提示）、偏好序列化、单实例、
-  图标资源、UI 后端等 93 项。
+  图标资源、配色可读性（对比度断言）、UI 后端、网卡切换与挑战回复校验等 100 项。
 
 ## 📂 目录结构
 
