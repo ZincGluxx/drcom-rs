@@ -48,12 +48,13 @@ drcom-cli — Dr.COM 校园网命令行认证客户端
   --dns <ip>              主 DNS，默认 10.10.10.10
   --dhcp <ip>             DHCP 服务器，默认 0.0.0.0
   --port <n>              认证服务器端口，默认 61440
-  --local-port <n>        本地端口，默认 61440；0 表示由系统分配
+  --local-port <n>        本地端口，默认 0（自动选择可用端口）
   --duration <秒>         保活时长，0 表示持续到手动停止，默认 0
   --once                  只认证一次，成功后立即下线
   --auth-route            解析认证服务器主机路由并打印计划，但不修改路由表
   --auth-route-apply      登录前添加认证服务器 /32 主机路由，下线后移除（需管理员）
-  --quiet                 只输出阶段变化与错误
+  --quiet                 只输出阶段变化与错误（默认）
+  --verbose               输出详细协议信息，用于临时排查
   --help                  显示本帮助
 
 配置文件（INI）示例：
@@ -169,10 +170,12 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut dns = file.dns.unwrap_or(Ipv4Addr::new(10, 10, 10, 10));
     let mut dhcp = file.dhcp.unwrap_or(Ipv4Addr::UNSPECIFIED);
     let mut port = file.server_port.unwrap_or(61440);
-    let mut local_port = file.local_port.unwrap_or(61440);
+    let mut local_port = file
+        .local_port
+        .unwrap_or(drcom_campus::transport::DEFAULT_LOCAL_PORT);
     let mut duration = Duration::ZERO;
     let mut once = false;
-    let mut quiet = false;
+    let mut quiet = true;
     let mut auth_route = file.auth_route.unwrap_or(RouteMode::Off);
 
     let mut index = 0;
@@ -246,6 +249,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--auth-route" => auth_route = RouteMode::DryRun,
             "--auth-route-apply" => auth_route = RouteMode::Manage,
             "--quiet" => quiet = true,
+            "--verbose" => quiet = false,
             other => return Err(format!("未知参数 {other}")),
         }
         index += 1;
@@ -479,16 +483,11 @@ impl Reporter {
                 if !self.quiet {
                     println!("{line}");
                 }
-                // The keep-alive line reaches the log even under `--quiet`: an
-                // unattended run is exactly the case where nobody is watching the
-                // terminal and the file is the only record left.
-                event_log::record(&format!("cli {line}"));
             }
         }
     }
 
-    /// Prints a line and mirrors it into the event log, so a run started from a
-    /// script or a scheduled task leaves the same trail as the GUI.
+    /// Prints user-requested CLI output; no automatic file logging.
     fn report(&self, line: &str) {
         println!("{line}");
         event_log::record(&format!("cli {line}"));

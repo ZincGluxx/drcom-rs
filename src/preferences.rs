@@ -10,6 +10,10 @@ use std::{
 pub struct Preferences {
     pub username: String,
     pub password: String,
+    /// Prevents a password in `drcom.ini` from being silently copied back into
+    /// the form after the user explicitly cleared this application's password.
+    #[serde(default)]
+    pub password_cleared: bool,
     pub auto_login: bool,
     pub auto_reconnect: bool,
     /// Mirrors the C# client's `MinimizeToTray`, which defaults to `true` and
@@ -25,6 +29,7 @@ impl Default for Preferences {
         Self {
             username: String::new(),
             password: String::new(),
+            password_cleared: false,
             auto_login: false,
             auto_reconnect: true,
             minimize_to_tray: true,
@@ -253,6 +258,7 @@ mod tests {
         let prefs = Preferences {
             username: "test-user".into(),
             password: "test-secret".into(),
+            password_cleared: false,
             auto_login: true,
             auto_reconnect: false,
             minimize_to_tray: false,
@@ -280,5 +286,6 @@ mod tests {
         assert_eq!(decoded.username, "someone");
         assert!(decoded.auto_login);
         assert!(decoded.minimize_to_tray, "the new option must default on");
+        assert!(!decoded.password_cleared);
     }
 }

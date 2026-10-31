@@ -21,6 +21,7 @@ pub mod event_log;
 pub mod keepalive;
 pub mod login_response;
 mod md5;
+pub mod page_status;
 pub mod preferences;
 pub mod protocol;
 pub mod reference_login;

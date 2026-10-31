@@ -16,6 +16,7 @@ use slint::ComponentHandle;
 use drcom_campus::adapter;
 use drcom_campus::config::ClientConfig;
 use drcom_campus::event_log;
+use drcom_campus::page_status::{self, CampusPage};
 use drcom_campus::preferences::{self, Preferences};
 use drcom_campus::session::{
     LoginSession, SessionConfig, SessionError, SessionEvent, SessionPhase,
@@ -71,8 +72,10 @@ impl ReconnectBackoff {
 
 struct Shared {
     stop: Option<Arc<AtomicBool>>,
+    reconnect_allowed: Arc<AtomicBool>,
     connected_since: Option<Instant>,
     pending_auto: Option<(Preferences, Instant)>,
+    page_probe_pending: bool,
     /// When the window should tuck itself away after a successful login. The C#
     /// client waits three seconds so the user actually sees the success state
     /// before the window disappears; hiding on the same frame as the reply reads
@@ -91,8 +94,10 @@ impl Default for Shared {
     fn default() -> Self {
         Self {
             stop: None,
+            reconnect_allowed: Arc::new(AtomicBool::new(false)),
             connected_since: None,
             pending_auto: None,
+            page_probe_pending: false,
             hide_at: None,
             // Same default as the C# client's `MinimizeToTray`.
             minimize_to_tray: true,
@@ -100,6 +105,51 @@ impl Default for Shared {
             probing: false,
             edit_adapter: None,
             network_busy: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageProbeOutcome {
+    app_session_active: bool,
+    canceled_auto_login: bool,
+}
+
+fn reconcile_page_probe_state(shared: &mut Shared, page: CampusPage) -> PageProbeOutcome {
+    shared.page_probe_pending = false;
+    let app_session_active = shared.stop.is_some() || shared.connected_since.is_some();
+    let canceled_auto_login = !app_session_active
+        && page == CampusPage::CurrentSession
+        && shared.pending_auto.take().is_some();
+    PageProbeOutcome {
+        app_session_active,
+        canceled_auto_login,
+    }
+}
+
+fn retry_attempt_admitted(first_attempt: bool, reconnect_allowed: bool, stopped: bool) -> bool {
+    !stopped && (first_attempt || reconnect_allowed)
+}
+
+fn page_probe_status(page: CampusPage, failed: bool, outcome: PageProbeOutcome) -> &'static str {
+    if failed || page == CampusPage::Unknown {
+        "网页状态未知；此程序连接状态未更改"
+    } else if outcome.app_session_active {
+        match page {
+            CampusPage::CurrentSession | CampusPage::LoginSucceeded => {
+                "此程序会话由左上角连接状态和 UDP 保活管理"
+            }
+            CampusPage::LoginForm => "网页返回登录表单；此程序 UDP 保活状态见左上角",
+            CampusPage::LoginRejected => "网页返回认证失败页；不代表 UDP 会话状态",
+            CampusPage::Unknown => "网页状态未知；此程序连接状态未更改",
+        }
+    } else {
+        match page {
+            CampusPage::LoginForm => "网页返回登录表单；此程序尚未建立 UDP 保活",
+            CampusPage::CurrentSession => "网页显示已有认证（外部会话）；此程序未建立 UDP 保活",
+            CampusPage::LoginRejected => "网页返回认证失败页；不代表 UDP 会话状态",
+            CampusPage::LoginSucceeded => "网页返回登录成功页；无法确认当前在线",
+            CampusPage::Unknown => "网页状态未知；此程序连接状态未更改",
         }
     }
 }
@@ -145,9 +195,11 @@ impl Backend {
         match preferences::path().and_then(|path| preferences::load(&path)) {
             Ok(prefs) => {
                 if !prefs.username.is_empty() {
-                    window.set_config_status("已加载加密设置".into());
+                    window.set_config_status("已记住你的账号".into());
                     window.set_username(prefs.username.clone().into());
-                    window.set_password(prefs.password.clone().into());
+                }
+                if let Some(password) = saved_password_for_form(&prefs) {
+                    window.set_password(password.into());
                 }
                 window.set_auto_login(prefs.auto_login);
                 window.set_auto_reconnect(prefs.auto_reconnect);
@@ -170,7 +222,8 @@ impl Backend {
         }
         backend.refresh_adapter(None);
         if let Some(complaint) = complaint {
-            backend.set_status(&complaint);
+            backend.remember_failure_text(&complaint);
+            backend.set_connection("未连接", &complaint);
         }
 
         let connect = backend.clone_handle();
@@ -200,7 +253,7 @@ impl Backend {
         let copy = backend.clone_handle();
         window.on_copy_requested(move || {
             if let Some(window) = copy.window.upgrade() {
-                match crate::diagnostics::copy(&diagnostics_report(&window)) {
+                match crate::diagnostics::copy(&diagnostics_report(&window, &copy.settings)) {
                     Ok(()) => copy.set_status("诊断已复制（不包含账号密码）"),
                     Err(error) => copy.set_status(&format!("复制失败：{error}")),
                 }
@@ -213,6 +266,7 @@ impl Backend {
                 let prefs = Preferences {
                     username: username.trim().to_string(),
                     password: password.to_string(),
+                    password_cleared: password.is_empty(),
                     auto_login,
                     auto_reconnect,
                     minimize_to_tray,
@@ -236,7 +290,7 @@ impl Backend {
                 if let Some(window) = save.window.upgrade() {
                     window.set_config_status(
                         if result.is_ok() {
-                            "已加密保存"
+                            "账号已安全保存"
                         } else {
                             "保存未完成"
                         }
@@ -255,6 +309,9 @@ impl Backend {
 
         let export = backend.clone_handle();
         window.on_export_requested(move || export.export_diagnostics());
+        let clear_password = backend.clone_handle();
+        window.on_clear_password_requested(move || clear_password.clear_saved_password());
+        backend.start_page_probe();
         backend
     }
 
@@ -280,9 +337,12 @@ impl Backend {
             return;
         }
         if let Some((prefs, deadline)) = shared.pending_auto.clone() {
-            if Instant::now() > deadline {
+            if shared.page_probe_pending {
+                drop(shared);
+            } else if Instant::now() > deadline {
                 shared.pending_auto = None;
                 drop(shared);
+                self.remember_failure_text("自动登录等待可用网络超时");
                 self.set_connection("未连接", "自动登录等待网卡超时，请连接网络后手动连接");
             } else if adapter::select_for(self.settings.servers_or_env().first().copied()).is_some()
             {
@@ -294,6 +354,52 @@ impl Backend {
                 self.set_connection("等待网络", "自动登录正在等待可用网卡…");
             }
         }
+    }
+
+    fn start_page_probe(&self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.page_probe_pending = true;
+        }
+        if let Some(window) = self.window.upgrade() {
+            window.set_campus_page_status("正在只读查询认证服务器首页…".into());
+        }
+        let backend = self.clone_handle();
+        let server = self.settings.servers_or_env().first().copied();
+        thread::spawn(move || {
+            let result = server.map(page_status::probe);
+            let (page, failed) = match result {
+                Some(Ok(page)) => (page, false),
+                Some(Err(_)) | None => (CampusPage::Unknown, true),
+            };
+            backend.complete_page_probe(page, failed);
+        });
+    }
+
+    fn complete_page_probe(&self, page: CampusPage, failed: bool) {
+        let outcome = if let Ok(mut shared) = self.shared.lock() {
+            reconcile_page_probe_state(&mut shared, page)
+        } else {
+            PageProbeOutcome {
+                app_session_active: false,
+                canceled_auto_login: false,
+            }
+        };
+        self.set_campus_page_status(page_probe_status(page, failed, outcome));
+
+        if outcome.canceled_auto_login {
+            event_log::record("启动网页状态显示已有认证；跳过本次自动登录，未接管外部会话");
+            self.set_status("网页显示已有认证；本程序未接管外部会话，也未启动 UDP 保活");
+        }
+    }
+
+    fn set_campus_page_status(&self, status: &str) {
+        let window = self.window.clone();
+        let status = status.to_string();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = window.upgrade() {
+                window.set_campus_page_status(status.into());
+            }
+        });
     }
 
     fn probe(&self, kind: i32) {
@@ -308,13 +414,36 @@ impl Backend {
             window.set_probe_busy(true);
         }
         let backend = self.clone_handle();
-        let server = self.settings.servers_or_env()[0];
+        let selected = match self.settings.local_ip {
+            Some(ip) => adapter::list().into_iter().find(|item| item.ipv4 == ip),
+            None => adapter::select_for(self.settings.servers_or_env().first().copied()),
+        };
         thread::spawn(move || {
-            let campus = (kind == 0 || kind == 2).then(|| crate::diagnostics::campus_probe(server));
-            let ipv4 = (kind == 1 || kind == 2)
-                .then(|| crate::diagnostics::internet_probe(crate::diagnostics::Family::V4));
-            let ipv6 = (kind == 2)
-                .then(|| crate::diagnostics::internet_probe(crate::diagnostics::Family::V6));
+            let (campus, ipv4, ipv6) = thread::scope(|scope| {
+                let campus =
+                    scope.spawn(|| (kind == 0 || kind == 2).then(crate::diagnostics::campus_probe));
+                let ipv4 = scope.spawn(|| {
+                    (kind == 1 || kind == 2).then(|| {
+                        crate::diagnostics::internet_probe(
+                            crate::diagnostics::Family::V4,
+                            selected.as_ref(),
+                        )
+                    })
+                });
+                let ipv6 = scope.spawn(|| {
+                    (kind == 1 || kind == 2).then(|| {
+                        crate::diagnostics::internet_probe(
+                            crate::diagnostics::Family::V6,
+                            selected.as_ref(),
+                        )
+                    })
+                });
+                (
+                    campus.join().unwrap(),
+                    ipv4.join().unwrap(),
+                    ipv6.join().unwrap(),
+                )
+            });
             // Recorded so a user reporting "the check says IPv6 is down" leaves
             // behind what it actually saw; otherwise the only evidence is the
             // screenshot they did not take.
@@ -335,10 +464,10 @@ impl Backend {
                         window.set_campus_result(result.into());
                     }
                     if let Some(result) = ipv4 {
-                        window.set_ipv4_result(result.into());
+                        window.set_ipv4_result(result.split('｜').next().unwrap_or(&result).into());
                     }
                     if let Some(result) = ipv6 {
-                        window.set_ipv6_result(result.into());
+                        window.set_ipv6_result(result.split('｜').next().unwrap_or(&result).into());
                     }
                     window.set_probe_busy(false);
                 }
@@ -484,6 +613,55 @@ impl Backend {
         }
     }
 
+    fn remember_failure(&self, detail: &str) {
+        let window = self.window.clone();
+        let detail = detail.to_string();
+        let occurred_at = event_log::timestamp();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = window.upgrade() {
+                window.set_last_failure(detail.into());
+                window.set_last_failure_time(occurred_at.into());
+            }
+        });
+    }
+
+    fn remember_failure_text(&self, detail: &str) {
+        self.remember_failure(detail);
+        let window = self.window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = window.upgrade() {
+                window.set_last_failure_stage("连接准备".into());
+                window.set_last_failure_code("LOCAL-NETWORK".into());
+                window.set_last_failure_duration("未开始".into());
+                window.set_last_failure_retry("不会自动重试".into());
+            }
+        });
+    }
+
+    fn remember_session_failure(
+        &self,
+        error: &SessionError,
+        elapsed: Duration,
+        retry_summary: &str,
+    ) {
+        let reason = describe_failure(error);
+        let (stage, code) = failure_stage_and_code(error);
+        let duration = format!("{}.{:03} 秒", elapsed.as_secs(), elapsed.subsec_millis());
+        self.remember_failure(&reason);
+        let window = self.window.clone();
+        let stage = stage.to_string();
+        let code = code.to_string();
+        let retry_summary = retry_summary.to_string();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(window) = window.upgrade() {
+                window.set_last_failure_stage(stage.into());
+                window.set_last_failure_code(code.into());
+                window.set_last_failure_duration(duration.into());
+                window.set_last_failure_retry(retry_summary.into());
+            }
+        });
+    }
+
     fn set_status(&self, text: &str) {
         let window = self.window.clone();
         let text = text.to_string();
@@ -563,17 +741,21 @@ impl Backend {
     /// Sleeps in short steps, so a stop request is honoured within [`SLEEP_STEP`]
     /// rather than after the whole delay. Returns `false` once stopping has been
     /// requested.
-    fn sleep_interruptibly(delay: Duration, stop: &AtomicBool) -> bool {
+    fn sleep_interruptibly(
+        delay: Duration,
+        stop: &AtomicBool,
+        reconnect_allowed: &AtomicBool,
+    ) -> bool {
         let mut remaining = delay;
         while !remaining.is_zero() {
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || !reconnect_allowed.load(Ordering::Relaxed) {
                 return false;
             }
             let step = remaining.min(SLEEP_STEP);
             thread::sleep(step);
             remaining -= step;
         }
-        !stop.load(Ordering::Relaxed)
+        !stop.load(Ordering::Relaxed) && reconnect_allowed.load(Ordering::Relaxed)
     }
 
     /// Writes the diagnostics text and the tail of the event log to one file, then
@@ -583,7 +765,7 @@ impl Backend {
         let Some(window) = self.window.upgrade() else {
             return;
         };
-        match crate::diagnostics::export(&diagnostics_report(&window)) {
+        match crate::diagnostics::export(&diagnostics_report(&window, &self.settings)) {
             Ok(path) => {
                 event_log::record(&format!("导出诊断文件：{}", path.display()));
                 self.set_status(&format!("诊断已导出：{}", path.display()));
@@ -607,7 +789,7 @@ impl Backend {
                     window.set_ipv4_address(found.ipv4.to_string().into());
                     window.set_mac_address(format_mac(found.mac).into());
                     window.set_status_detail(
-                        note.unwrap_or_else(|| format!("网卡 {} 已就绪", found.description))
+                        note.unwrap_or_else(|| "网络已就绪，填写账号密码后即可连接".to_string())
                             .into(),
                     );
                 }
@@ -620,7 +802,7 @@ impl Backend {
                     window.set_ipv6("--".into());
                     window.set_status_detail(
                         note.unwrap_or_else(|| {
-                            "未检测到可用的物理有线或无线网卡，已排除虚拟网卡".to_string()
+                            "没有找到可用的网络连接，请插好网线或连接校园 Wi-Fi 后刷新".to_string()
                         })
                         .into(),
                     );
@@ -644,11 +826,62 @@ impl Backend {
             .and_then(|shared| shared.stop.clone());
         match stop {
             Some(stop) => {
+                if let Ok(shared) = self.shared.lock() {
+                    shared.reconnect_allowed.store(false, Ordering::Relaxed);
+                }
                 stop.store(true, Ordering::Relaxed);
                 self.set_connection("断开中", "正在下线…");
             }
             None => self.set_status("当前没有进行中的连接"),
         }
+    }
+
+    fn clear_saved_password(&self) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let prefs = cleared_password_preferences(
+            window.get_username().trim().to_string(),
+            window.get_auto_reconnect(),
+            window.get_minimize_to_tray(),
+        );
+        let saved = preferences::path()
+            .and_then(|path| preferences::save(&path, &prefs))
+            .is_ok();
+
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.pending_auto = None;
+            shared.reconnect_allowed.store(false, Ordering::Relaxed);
+        }
+
+        window.set_password("".into());
+        window.set_auto_login(false);
+        window.set_failure_details_expanded(false);
+        if saved {
+            window.set_config_status("已清除此程序保存的密码".into());
+        } else {
+            window.set_config_status("密码已从界面清除，但清除状态未能保存".into());
+        }
+
+        if window.get_connection_state() == "重连中" {
+            window.set_last_failure_retry("已取消重连；不会再使用本次会话凭据".into());
+        }
+        if !self.settings.password.is_empty() {
+            self.set_status(if saved {
+                "此程序保存的密码已清除；drcom.ini 中仍有你配置的密码，本程序不会自动回填或修改它"
+            } else {
+                "界面密码已清空，但清除状态未保存；drcom.ini 仍由你管理，当前不会自动重连"
+            });
+        } else if saved {
+            self.set_status("已清除保存的密码；当前 UDP 保活继续运行，连接中断后不会用旧密码重连");
+        } else {
+            self.set_status("界面密码已清空；当前 UDP 保活继续运行，连接中断后不会自动重连");
+        }
+        event_log::record(if saved {
+            "用户清除已保存密码；取消待自动登录并停用后续凭据重连"
+        } else {
+            "用户请求清除已保存密码；保存清除状态失败，取消待自动登录并停用后续凭据重连"
+        });
     }
 
     fn show_session_adapter(&self, found: &adapter::AdapterInfo) {
@@ -665,12 +898,15 @@ impl Backend {
     }
 
     fn start(&self, username: String, password: String, auto_reconnect: bool) {
-        if self
-            .shared
-            .lock()
-            .map(|shared| shared.stop.is_some() || shared.quitting)
-            .unwrap_or(true)
-        {
+        let can_start = self.shared.lock().is_ok_and(|mut shared| {
+            if shared.stop.is_some() || shared.quitting {
+                false
+            } else {
+                shared.pending_auto = None;
+                true
+            }
+        });
+        if !can_start {
             self.set_status("连接已在进行中");
             return;
         }
@@ -682,6 +918,7 @@ impl Backend {
         if servers.is_empty() {
             // `servers_or_env` falls back to the built-in campus address, so
             // this branch only fires if that constant is ever emptied.
+            self.remember_failure_text("没有可用的认证服务器地址");
             self.set_connection("未连接", "没有可用的认证服务器地址");
             return;
         }
@@ -692,7 +929,11 @@ impl Backend {
             None => adapter::select_for(servers.first().copied()),
         };
         let Some(found) = selected else {
-            self.set_connection("未连接", "未检测到可用的物理网卡，已在设置中排除虚拟网卡");
+            self.remember_failure_text("没有找到可用的校园网连接");
+            self.set_connection(
+                "未连接",
+                "没有找到可用的校园网连接，请插好网线或连接校园 Wi-Fi，再点击刷新",
+            );
             return;
         };
 
@@ -726,17 +967,46 @@ impl Backend {
         ));
 
         let stop = Arc::new(AtomicBool::new(false));
+        let reconnect_allowed = Arc::new(AtomicBool::new(auto_reconnect));
         if let Ok(mut shared) = self.shared.lock() {
             shared.stop = Some(Arc::clone(&stop));
+            shared.reconnect_allowed = Arc::clone(&reconnect_allowed);
             shared.connected_since = None;
             shared.pending_auto = None;
         }
-        self.set_connection("连接中", "正在请求挑战…");
+        self.set_connection("连接中", "正在联系校园网服务器…");
 
         let backend = self.clone_handle();
         thread::spawn(move || {
             let mut backoff = ReconnectBackoff::new();
+            let mut first_attempt = true;
+            let mut retry_result = None;
             loop {
+                // Admission and password clearing share this mutex, so clearing
+                // credentials after the backoff wait is observed before another
+                // session can be constructed with the captured old password.
+                let admitted = backend.shared.lock().is_ok_and(|shared| {
+                    retry_attempt_admitted(
+                        first_attempt,
+                        shared.reconnect_allowed.load(Ordering::Relaxed),
+                        stop.load(Ordering::Relaxed),
+                    )
+                });
+                if !admitted {
+                    let (result, elapsed) = retry_result.take().unwrap_or((
+                        Err(drcom_campus::session::SessionError::Stopped),
+                        Duration::ZERO,
+                    ));
+                    let result = if stop.load(Ordering::Relaxed) {
+                        Err(drcom_campus::session::SessionError::Stopped)
+                    } else {
+                        result
+                    };
+                    backend.finish(result, elapsed);
+                    break;
+                }
+                first_attempt = false;
+
                 let started = Instant::now();
                 let result = match LoginSession::new(config.clone()) {
                     Ok(mut session) => {
@@ -745,11 +1015,13 @@ impl Backend {
                     }
                     Err(error) => Err(error),
                 };
+                let elapsed = started.elapsed();
                 let retry = auto_reconnect
+                    && reconnect_allowed.load(Ordering::Relaxed)
                     && !stop.load(Ordering::Relaxed)
                     && result.as_ref().is_err_and(retryable_error);
                 if !retry {
-                    backend.finish(result);
+                    backend.finish(result, elapsed);
                     break;
                 }
                 // A session that stayed up long enough to count as working starts
@@ -765,15 +1037,26 @@ impl Backend {
                     Err(error) => describe_failure(error),
                 };
                 event_log::record(&format!("连接中断：{reason}；{seconds} 秒后重试"));
-                backend.set_connection("重连中", &format!("连接中断，{seconds} 秒后重新认证…"));
+                if let Err(error) = &result {
+                    backend.remember_session_failure(
+                        error,
+                        elapsed,
+                        &format!("将在 {seconds} 秒后重试；本次会复用当前会话凭据"),
+                    );
+                }
+                backend.set_connection("重连中", &format!("{reason}（{seconds} 秒后自动重试）"));
                 backend.set_tooltip_text(&format!("{reason}，{seconds} 秒后重试"));
                 if let Ok(mut shared) = backend.shared.lock() {
                     shared.connected_since = None;
                     shared.hide_at = None;
                 }
                 backend.set_online_duration("--");
-                if !Backend::sleep_interruptibly(delay, &stop) {
-                    backend.finish(Err(drcom_campus::session::SessionError::Stopped));
+                if !Backend::sleep_interruptibly(delay, &stop, &reconnect_allowed) {
+                    if stop.load(Ordering::Relaxed) {
+                        backend.finish(Err(drcom_campus::session::SessionError::Stopped), elapsed);
+                    } else {
+                        backend.finish(result, elapsed);
+                    }
                     break;
                 }
                 // Automatic sessions discover again inside the session, using
@@ -785,6 +1068,7 @@ impl Backend {
                         .find(|found| found.ipv4 == ip)
                         .map(|found| found.interface_index);
                 }
+                retry_result = Some((result, elapsed));
             }
         });
     }
@@ -793,8 +1077,10 @@ impl Backend {
         match event {
             SessionEvent::AdapterSelected(found) => self.show_session_adapter(&found),
             SessionEvent::Phase(phase) => match phase {
-                SessionPhase::Challenge => self.set_connection("连接中", "正在请求挑战…"),
-                SessionPhase::Authenticating => self.set_connection("连接中", "正在认证…"),
+                SessionPhase::Challenge => self.set_connection("连接中", "正在联系校园网服务器…"),
+                SessionPhase::Authenticating => {
+                    self.set_connection("连接中", "正在检查账号和密码…")
+                }
                 SessionPhase::Online => {
                     let minimize = if let Ok(mut shared) = self.shared.lock() {
                         let now = Instant::now();
@@ -805,33 +1091,30 @@ impl Backend {
                     } else {
                         false
                     };
-                    event_log::record("认证成功，进入保活");
-                    self.set_connection("已连接", "认证成功，正在保活");
+                    event_log::record("登录成功");
+                    self.set_campus_page_status("此程序 UDP 保活已建立");
+                    self.set_connection("已连接", "登录成功，可以使用校园网了");
                     self.set_online_duration("0 秒");
                     // The window is about to disappear, so the tray has to carry
                     // the news as well.
                     self.set_tooltip_text(if minimize {
                         "已连接，稍后最小化到托盘"
                     } else {
-                        "已连接，保活中"
+                        "已连接，正在保持在线"
                     });
                 }
-                SessionPhase::KeepAlive => self.set_connection("已连接", "保活中"),
+                SessionPhase::KeepAlive => self.set_connection("已连接", "连接正常，正在保持在线"),
                 SessionPhase::LoggedOut => {
                     event_log::record("已发送下线报文");
+                    self.set_campus_page_status("此程序 UDP 保活已停止");
                     self.set_connection("未连接", "已下线");
                 }
             },
-            SessionEvent::Note(note) => {
-                event_log::record(&note);
-                self.set_status(&note);
-            }
-            SessionEvent::KeepAliveCycle { sequence, .. } => {
-                // One line per cycle: at the reference 20-second interval this is
-                // a few kilobytes an hour, and it is the only record that shows a
-                // session quietly resynchronising instead of dropping.
-                event_log::record(&format!("保活正常，序号 {sequence}"));
-                self.set_status(&format!("保活正常，序号 {sequence}"));
+            // Protocol notes include salts, session tokens and sequence counters.
+            // Keep them out of the everyday UI and shareable diagnostics.
+            SessionEvent::Note(_) => {}
+            SessionEvent::KeepAliveCycle { .. } => {
+                self.set_status("连接正常，正在保持在线");
                 let duration = self
                     .shared
                     .lock()
@@ -854,7 +1137,7 @@ impl Backend {
         });
     }
 
-    fn finish(&self, result: Result<(), drcom_campus::session::SessionError>) {
+    fn finish(&self, result: Result<(), drcom_campus::session::SessionError>, elapsed: Duration) {
         let mut quitting = false;
         if let Ok(mut shared) = self.shared.lock() {
             shared.stop = None;
@@ -865,7 +1148,14 @@ impl Backend {
         self.set_online_duration("--");
         let detail = match result {
             Ok(()) | Err(SessionError::Stopped) => "已下线".to_string(),
-            Err(error) => describe_failure(&error),
+            Err(error) => {
+                let detail = describe_failure(&error);
+                self.remember_session_failure(&error, elapsed, "不会自动重试");
+                if let SessionError::Transport(kind) = &error {
+                    event_log::record(&format!("网络错误类别：{kind:?}"));
+                }
+                detail
+            }
         };
         event_log::record(&format!("会话结束：{detail}"));
         // By now the window is usually in the tray, where the status line is
@@ -883,35 +1173,55 @@ impl Backend {
 /// The account and password are deliberately absent: this is the string a user
 /// pastes into a public issue or hands to a stranger at the network centre. The
 /// tail of the event log is included because "它连不上" is not a report.
-fn diagnostics_report(window: &AppWindow) -> String {
+fn diagnostics_report(window: &AppWindow, settings: &ClientConfig) -> String {
     let recent = event_log::tail(40);
-    let recent = if recent.is_empty() {
-        "（本次运行还没有日志）".to_string()
-    } else {
-        recent
-    };
+    let adapters = adapter::list()
+        .into_iter()
+        .map(|item| {
+            format!(
+                "{} / {} / IPv4 {} / 网关 {} / IPv6 {}",
+                item.friendly_name,
+                item.description,
+                item.ipv4,
+                item.details
+                    .gateways
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                item.details
+                    .ipv6
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let local_port = settings
+        .local_port
+        .unwrap_or(drcom_campus::transport::DEFAULT_LOCAL_PORT);
     format!(
-        "DrCom Rust {}\n\
-         导出时间：{}\n\
-         状态：{}\n\
-         网卡：{}\n\
-         IPv4：{}\n\
-         MAC：{}\n\
-         网关：{}\n\
-         DNS：{}\n\
-         IPv6：{}\n\
-         在线时长：{}\n\
-         校内：{}\n\
-         公网 IPv4：{}\n\
-         公网 IPv6：{}\n\
-         关闭窗口最小化到托盘：{}\n\
-         探测使用系统路由，不等同于认证状态。\n\
-         \n\
-         认证服务器：{}\n\
-         最近日志：\n{}",
+        "DrCom 校园网助手 {}\n检测结果生成时间：{}\n\n\
+         当前状态：{}\n当前说明：{}\n网页只读状态：{}\n最近一次连接问题：{}\n\
+         错误阶段：{}\n错误码：{}\n发生时间：{}\n本次会话/尝试耗时：{}\n重试安全摘要：{}\n\n\
+         登录使用的网卡：{}\nIPv4：{}\nMAC：{}\n网关：{}\nDNS：{}\nIPv6：{}\n在线时长：{}\n\n\
+         校内（Ping jlu.edu.cn / IPv4）：{}\n外网（HTTPS / IPv4）：{}\n外网（HTTPS / IPv6）：{}\n\
+         外网通过所选校园网网卡直接访问 HTTPS 网站，分别指定 IPv4 / IPv6，不使用应用代理，验证证书与网站响应，主站失败后使用备用站点复核。校内仍使用 Ping，Ping 无回复不等于断网。\n\n\
+         认证服务器：{}\n服务器端口：{}\n本地端口设置：{}\n配置文件：{}\n\n\
+         可用物理网卡：\n{}\n\n本次运行的诊断摘要（仅保存在内存，退出后清空）：\n{}",
         env!("CARGO_PKG_VERSION"),
         event_log::timestamp(),
         window.get_connection_state(),
+        window.get_status_detail(),
+        window.get_campus_page_status(),
+        window.get_last_failure(),
+        window.get_last_failure_stage(),
+        window.get_last_failure_code(),
+        window.get_last_failure_time(),
+        window.get_last_failure_duration(),
+        window.get_last_failure_retry(),
         window.get_adapter_name(),
         window.get_ipv4_address(),
         window.get_mac_address(),
@@ -922,14 +1232,24 @@ fn diagnostics_report(window: &AppWindow) -> String {
         window.get_campus_result(),
         window.get_ipv4_result(),
         window.get_ipv6_result(),
-        if window.get_minimize_to_tray() {
-            "是"
+        settings
+            .servers_or_env()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        settings
+            .server_port
+            .unwrap_or(drcom_campus::transport::DEFAULT_SERVER_PORT),
+        if local_port == 0 {
+            "自动选择可用端口".into()
         } else {
-            "否"
+            format!("固定端口 {local_port}")
         },
         drcom_campus::config::discover()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "无配置文件（使用内置认证服务器）".to_string()),
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "使用默认设置".into()),
+        adapters,
         recent
     )
 }
@@ -1019,14 +1339,65 @@ fn validate_preferences(
     .map_err(|e| e.to_string())
 }
 
+fn saved_password_for_form(prefs: &Preferences) -> Option<String> {
+    if prefs.password_cleared {
+        Some(String::new())
+    } else if !prefs.username.is_empty() {
+        Some(prefs.password.clone())
+    } else {
+        None
+    }
+}
+
+fn cleared_password_preferences(
+    username: String,
+    auto_reconnect: bool,
+    minimize_to_tray: bool,
+) -> Preferences {
+    Preferences {
+        username,
+        password: String::new(),
+        password_cleared: true,
+        auto_login: false,
+        auto_reconnect,
+        minimize_to_tray,
+    }
+}
+
 /// The failure text, plus a sentence saying what to do when one is known.
 ///
 /// `SessionError` already renders Chinese, but "认证服务器未响应：keepalive" leaves the
 /// user with nothing to try. The guidance supplies the "and now what".
 fn describe_failure(error: &SessionError) -> String {
+    let summary = match error {
+        SessionError::Configuration(_) => "认证配置无效".to_string(),
+        SessionError::Challenge(_) => "无法开始登录".to_string(),
+        SessionError::Rejected(failure) => format!("服务器拒绝认证，错误码 {}", failure.code),
+        SessionError::LogoutPacket(_) => "下线请求无法构造".to_string(),
+        SessionError::Route(_) => "无法为认证服务器设置网络路由".to_string(),
+        // These variants contain only a fixed stage name or an ErrorKind.
+        SessionError::Transport(_) | SessionError::NoResponse(_) | SessionError::Credentials(_) => {
+            error.to_string()
+        }
+        SessionError::Stopped => "会话已停止".to_string(),
+    };
     match error.guidance() {
-        Some(hint) => format!("{error}｜{hint}"),
-        None => error.to_string(),
+        Some(hint) => format!("{summary}｜{hint}"),
+        None => summary,
+    }
+}
+
+fn failure_stage_and_code(error: &SessionError) -> (String, String) {
+    match error {
+        SessionError::Configuration(_) => ("配置".into(), "CONFIGURATION".into()),
+        SessionError::Transport(kind) => ("网络通信".into(), format!("NETWORK-{kind:?}")),
+        SessionError::Challenge(_) => ("挑战".into(), "CHALLENGE".into()),
+        SessionError::Credentials(_) => ("账号格式".into(), "CREDENTIALS".into()),
+        SessionError::Rejected(failure) => ("认证".into(), format!("DRCOM-{}", failure.code)),
+        SessionError::NoResponse(stage) => ((*stage).into(), format!("NO-RESPONSE-{stage}")),
+        SessionError::Stopped => ("停止".into(), "STOPPED".into()),
+        SessionError::LogoutPacket(_) => ("下线".into(), "LOGOUT-PACKET".into()),
+        SessionError::Route(_) => ("网络路由".into(), "ROUTE".into()),
     }
 }
 
@@ -1105,8 +1476,121 @@ mod tests {
     }
 
     #[test]
+    fn external_session_probe_cancels_pending_auto_login_without_starting_our_session() {
+        let mut shared = Shared {
+            page_probe_pending: true,
+            pending_auto: Some((
+                Preferences::default(),
+                Instant::now() + Duration::from_secs(90),
+            )),
+            ..Default::default()
+        };
+
+        let outcome = reconcile_page_probe_state(&mut shared, CampusPage::CurrentSession);
+
+        assert!(!outcome.app_session_active);
+        assert!(outcome.canceled_auto_login);
+        assert!(!shared.page_probe_pending);
+        assert!(shared.pending_auto.is_none());
+        assert!(shared.stop.is_none());
+        assert_eq!(
+            page_probe_status(CampusPage::CurrentSession, false, outcome),
+            "网页显示已有认证（外部会话）；此程序未建立 UDP 保活"
+        );
+    }
+
+    #[test]
+    fn late_page_probe_preserves_an_active_manual_udp_session() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut shared = Shared {
+            stop: Some(Arc::clone(&stop)),
+            connected_since: Some(Instant::now()),
+            page_probe_pending: true,
+            ..Shared::default()
+        };
+
+        let outcome = reconcile_page_probe_state(&mut shared, CampusPage::CurrentSession);
+
+        assert!(outcome.app_session_active);
+        assert!(!outcome.canceled_auto_login);
+        assert!(!shared.page_probe_pending);
+        assert!(Arc::ptr_eq(shared.stop.as_ref().unwrap(), &stop));
+        assert!(!stop.load(Ordering::Relaxed));
+        assert!(shared.connected_since.is_some());
+        assert_eq!(
+            page_probe_status(CampusPage::CurrentSession, false, outcome),
+            "此程序会话由左上角连接状态和 UDP 保活管理"
+        );
+    }
+
+    #[test]
+    fn login_form_probe_does_not_cancel_pending_auto_login() {
+        let mut shared = Shared::default();
+        let prefs = Preferences {
+            auto_login: true,
+            username: "test-user".into(),
+            password: "test-pass".into(),
+            ..Default::default()
+        };
+        shared.pending_auto = Some((prefs, Instant::now() + Duration::from_secs(90)));
+
+        let outcome = reconcile_page_probe_state(&mut shared, CampusPage::LoginForm);
+
+        assert!(!outcome.app_session_active);
+        assert!(!outcome.canceled_auto_login);
+        assert!(shared.pending_auto.is_some());
+    }
+
+    #[test]
+    fn reconnect_admission_rechecks_clear_between_backoff_and_attempt() {
+        assert!(retry_attempt_admitted(true, false, false));
+        assert!(retry_attempt_admitted(false, true, false));
+        // The reconnect delay completed, then password clearing disabled retries
+        // before the loop could construct the next LoginSession.
+        assert!(!retry_attempt_admitted(false, false, false));
+        assert!(!retry_attempt_admitted(false, true, true));
+        assert!(!retry_attempt_admitted(true, true, true));
+    }
+
+    #[test]
+    fn clearing_password_disables_saved_login_and_overrides_ini_backfill() {
+        let prefs = cleared_password_preferences("test-user".into(), true, false);
+        assert_eq!(prefs.username, "test-user");
+        assert!(prefs.password.is_empty());
+        assert!(!prefs.auto_login);
+        assert!(prefs.password_cleared);
+        assert!(prefs.auto_reconnect);
+        assert!(!prefs.minimize_to_tray);
+        assert_eq!(saved_password_for_form(&prefs).as_deref(), Some(""));
+
+        // A legacy preference file without a username leaves the drcom.ini
+        // password alone; the persisted clear marker overrides it explicitly.
+        assert_eq!(saved_password_for_form(&Preferences::default()), None);
+    }
+
+    #[test]
+    fn exported_failure_summary_does_not_include_server_supplied_text() {
+        let error = SessionError::Rejected(drcom_campus::login_response::LoginFailure {
+            code: 21,
+            ip: None,
+            mac: None,
+            message: Some(b"secret-packet-marker".to_vec()),
+        });
+        let summary = describe_failure(&error);
+        assert!(summary.contains("错误码 21"));
+        assert!(!summary.contains("secret-packet-marker"));
+        assert_eq!(
+            failure_stage_and_code(&error),
+            ("认证".into(), "DRCOM-21".into())
+        );
+    }
+
+    #[test]
     fn gui_applies_connection_configuration() {
         let mut session = SessionConfig::new(vec![], vec![], vec![]);
+        // Source port allocation must never change the destination port.
+        assert_eq!(session.server_port, 61440);
+        assert_eq!(session.local_port, 0);
         let settings = ClientConfig {
             server_port: Some(6000),
             local_port: Some(0),
@@ -1161,16 +1645,22 @@ mod tests {
 
     #[test]
     fn a_failure_shows_the_advice_next_to_the_reason() {
+        let denied = describe_failure(&SessionError::Transport(
+            std::io::ErrorKind::PermissionDenied,
+        ));
+        assert!(denied.contains("系统保留"));
+        assert!(denied.contains("local_port"));
+        assert!(!denied.contains("管理员"));
         let text = describe_failure(&SessionError::NoResponse("keepalive"));
         assert!(
-            text.contains("keepalive"),
+            text.contains("连接可能已中断"),
             "the reason must survive: {text}"
         );
         assert!(
             text.contains("网线"),
             "an unanswered server should suggest checking the cable: {text}"
         );
-        // A rejection's own text is the advice, so nothing is appended.
+        // A bare server code still needs a useful next step.
         let rejected = describe_failure(&SessionError::Rejected(
             drcom_campus::login_response::LoginFailure {
                 code: 2,
@@ -1179,7 +1669,7 @@ mod tests {
                 message: None,
             },
         ));
-        assert!(!rejected.contains('｜'), "got {rejected}");
+        assert!(rejected.contains("账号密码"), "got {rejected}");
     }
 
     #[test]

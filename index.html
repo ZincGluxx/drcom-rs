@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="drcom-rs：使用 Rust 和 Slint 开发的吉林大学校园网 Dr.COM 客户端，支持自动登录、断线重连和网络检测。">
+  <meta name="theme-color" content="#f7f9fc">
+  <title>drcom-rs · DrCom 校园网助手</title>
+  <style>
+    :root {
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      color: #253046;
+      background: #f7f9fc;
+      font-synthesis: none;
+      line-height: 1.7;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    a { color: #275f9e; text-underline-offset: 4px; }
+    a:focus-visible { outline: 3px solid #82b4ee; outline-offset: 5px; }
+    .page { width: min(100% - 48px, 1040px); margin: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 26px 0; border-bottom: 1px solid #e1e6ee; }
+    .project { color: #253046; font: 600 17px ui-monospace, Consolas, monospace; text-decoration: none; }
+    .header-link { color: #758094; font-size: 13px; text-decoration: none; }
+    .hero { display: grid; grid-template-columns: 1fr 1.05fr; align-items: center; gap: 48px; padding: 65px 0 55px; }
+    .platform { margin: 0 0 13px; color: #6c7b91; font-size: 13px; }
+    h1 { margin: 0 0 17px; font-size: clamp(29px, 4vw, 39px); line-height: 1.3; font-weight: 650; letter-spacing: -.04em; }
+    .intro { margin: 0; color: #58677c; font-size: 15px; line-height: 1.95; }
+    .links { display: flex; flex-wrap: wrap; gap: 11px; margin-top: 25px; }
+    .button { display: inline-flex; align-items: center; justify-content: center; padding: 10px 18px; border: 1px solid #d8dfe9; border-radius: 7px; color: #35465e; background: #fff; font-size: 14px; text-decoration: none; }
+    .button:hover { background: #edf2f9; }
+    .download { border-color: #2c609e; color: #fff; background: #2c609e; }
+    .download:hover { background: #234f83; }
+    .download-note { margin: 12px 0 0; color: #8290a2; font-size: 12px; }
+    .intro-detail { margin: 12px 0 0; color: #58677c; font-size: 14px; line-height: 1.85; }
+    figure { margin: 0; }
+    figure img { display: block; width: 100%; height: auto; border: 1px solid #dfe5ef; border-radius: 10px; box-shadow: 0 12px 35px #2339560b; }
+    figcaption { margin-top: 9px; color: #8b95a5; text-align: center; font-size: 12px; }
+    section { padding: 32px 0; border-top: 1px solid #e1e6ee; }
+    h2 { margin: 0 0 23px; font-size: 20px; font-weight: 650; }
+    .advantages { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 55px; margin-bottom: 24px; }
+    .advantages h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+    .advantages p { margin: 0; color: #657287; font-size: 14px; }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 24px; border: 1px solid #dfe5ef; border-radius: 10px; background: #fff; }
+    .metric { margin: 0; }
+    .metric dt { color: #657287; font-size: 13px; }
+    .metric dd { margin: 7px 0 0; color: #275f9e; font-size: 29px; font-weight: 650; line-height: 1.3; font-variant-numeric: tabular-nums; }
+    .metric dd span { font-size: 13px; font-weight: 400; }
+    .measurement-note { margin: 12px 0 0; color: #748196; font-size: 12px; line-height: 1.85; }
+    .features { display: grid; grid-template-columns: 1fr 1fr; gap: 25px 55px; }
+    .features h3 { margin: 0 0 5px; font-size: 15px; font-weight: 600; }
+    .features p { margin: 0; color: #657287; font-size: 14px; }
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; margin: 0; padding-left: 22px; }
+    .steps li { padding-left: 3px; font-size: 14px; }
+    .steps li::marker { color: #2c609e; font-weight: 600; }
+    .steps strong { font-weight: 600; }
+    .steps p { margin: 5px 0 0; color: #657287; }
+    .cli { margin: 24px 0 0; padding: 15px 18px; border-radius: 7px; color: #657287; background: #edf1f7; font-size: 13px; }
+    code { color: #344b6b; font-family: ui-monospace, Consolas, monospace; }
+    footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px 24px; margin-top: 7px; padding: 24px 0 30px; border-top: 1px solid #e1e6ee; color: #8490a0; font-size: 12px; }
+    footer a { color: inherit; overflow-wrap: anywhere; }
+    @media (max-width: 760px) {
+      .hero { grid-template-columns: 1fr; gap: 30px; padding: 40px 0; }
+      figure { width: min(100%, 550px); margin-inline: auto; }
+      .features { gap: 23px 28px; }
+      .steps { grid-template-columns: 1fr; gap: 17px; }
+    }
+    @media (max-width: 480px) {
+      .page { width: calc(100% - 36px); }
+      header { padding: 20px 0; }
+      .features, .advantages { grid-template-columns: 1fr; }
+      .metrics { gap: 16px 8px; padding: 18px 13px; }
+      .metric dt { font-size: 11px; }
+      .metric dd { font-size: 23px; }
+      .metric dd span { font-size: 11px; }
+      .button { padding-inline: 15px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <a class="project" href="https://github.com/ZincGluxx/drcom-rs" target="_blank" rel="noopener noreferrer">drcom-rs</a>
+      <a class="header-link" href="https://github.com/ZincGluxx/drcom-rs/releases" target="_blank" rel="noopener noreferrer">版本记录 ↗</a>
+    </header>
+    <main>
+      <div class="hero">
+        <div>
+          <p class="platform">Windows x64 · Rust + Slint</p>
+          <h1>DrCom 校园网助手</h1>
+          <p class="intro">一个用于吉林大学校园网的 Dr.COM 客户端。填写账号密码即可登录，支持自动保活和断线重连，也能查看网卡信息、检测 IPv4 / IPv6 网络。</p>
+          <p class="intro-detail">Rust 原生程序，常驻占用约 24 MiB。保存账号后可自动登录，优先使用上次认证成功的网卡。</p>
+          <div class="links">
+            <a class="button download" href="https://github.com/ZincGluxx/drcom-rs/releases/latest" target="_blank" rel="noopener noreferrer">下载 Windows 版</a>
+            <a class="button" href="https://github.com/ZincGluxx/drcom-rs" target="_blank" rel="noopener noreferrer">查看源码</a>
+          </div>
+          <p class="download-note">安装包和更新说明见 GitHub Releases。</p>
+        </div>
+        <figure>
+          <img src="docs/screenshot.png" alt="DrCom 校园网助手，左侧为账号设置，右侧为网络概览与检测" width="650" height="488">
+          <figcaption>客户端界面</figcaption>
+        </figure>
+      </div>
+      <section aria-labelledby="advantages-title">
+        <h2 id="advantages-title">使用优势</h2>
+        <div class="advantages">
+          <div>
+            <h3>占用低，适合常驻</h3>
+            <p>本机实测工作集约 24 MiB，运行时只有 4 个线程。认证与保活由程序独立完成，无需安装原版组件。</p>
+          </div>
+          <div>
+            <h3>登录流程更直接</h3>
+            <p>直接进行网卡探测与认证，优先使用上次认证成功的网卡，减少重复探测。保存账号后可自动登录，断线后也能自动恢复。</p>
+          </div>
+        </div>
+        <div class="metrics" aria-label="Rust 1.0.4 本机运行占用">
+          <dl class="metric"><dt>工作集内存</dt><dd>23.95 <span>MiB</span></dd></dl>
+          <dl class="metric"><dt>私有提交内存</dt><dd>5.56 <span>MiB</span></dd></dl>
+          <dl class="metric"><dt>线程数</dt><dd>4 <span>个</span></dd></dl>
+        </div>
+        <p class="measurement-note">本机实测：2026-10-26 · Windows x64 · Rust 1.0.4，10 次采样的内存中位数。实际占用随运行环境变化。<a href="docs/footprint-2026-10-26.json" download>采样数据</a> · <a href="docs/footprint-notes.md">测量说明</a></p>
+      </section>
+      <section aria-labelledby="features-title">
+        <h2 id="features-title">主要功能</h2>
+        <div class="features">
+          <div>
+            <h3>自动登录与重连</h3>
+            <p>连接后自动发送心跳保活；可开启自动登录、自动重连和开机自启。</p>
+          </div>
+          <div>
+            <h3>网络信息与检测</h3>
+            <p>显示网卡、IP、网关和 DNS，支持校内连通性检测及 IPv4 / IPv6 外网检测。</p>
+          </div>
+          <div>
+            <h3>托盘运行</h3>
+            <p>关闭窗口后可继续在托盘运行，通过托盘菜单连接、下线或退出。</p>
+          </div>
+          <div>
+            <h3>凭据加密</h3>
+            <p>保存的账号凭据由 Windows DPAPI 加密，避免以明文保存密码。</p>
+          </div>
+        </div>
+      </section>
+      <section aria-labelledby="usage-title">
+        <h2 id="usage-title">使用方法</h2>
+        <ol class="steps">
+          <li><strong>下载安装</strong><p>到发布页下载 Windows x64 安装包，按提示安装。</p></li>
+          <li><strong>填写账号</strong><p>接入校园网后，输入自己的校园网账号和密码。</p></li>
+          <li><strong>点击连接</strong><p>登录成功后保持运行，按需开启自动登录和开机自启。</p></li>
+        </ol>
+        <p class="cli">项目也提供命令行工具 <code>drcom-cli</code>，适合脚本或无桌面环境。配置与参数说明见 <a href="https://github.com/ZincGluxx/drcom-rs#readme" target="_blank" rel="noopener noreferrer">README</a>。</p>
+      </section>
+    </main>
+    <footer>
+      <a href="https://github.com/ZincGluxx/drcom-rs" target="_blank" rel="noopener noreferrer">github.com/ZincGluxx/drcom-rs</a>
+      <span>ZincGlux · <a href="https://github.com/ZincGluxx/drcom-rs/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">CC BY-NC 4.0</a></span>
+    </footer>
+  </div>
+</body>
+</html>

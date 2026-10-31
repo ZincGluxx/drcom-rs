@@ -91,20 +91,59 @@ impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration(error) => write!(f, "认证服务器列表无效：{error:?}"),
-            Self::Transport(io::ErrorKind::AddrInUse) => write!(
+            Self::Transport(io::ErrorKind::AddrInUse) => {
+                write!(f, "连接使用的本地端口已被其他程序占用")
+            }
+            Self::Transport(kind) => write!(
                 f,
-                "本地端口被占用，请关闭其它 Dr.COM 客户端，或用 --local-port 0 让系统分配端口"
+                "{}",
+                match kind {
+                    io::ErrorKind::PermissionDenied =>
+                        "Windows 阻止了客户端使用网络，可能是端口被系统保留或安全软件拦截",
+                    io::ErrorKind::AddrNotAvailable => "本机网络地址已变化或不可用",
+                    io::ErrorKind::NetworkDown
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::HostUnreachable => "无法通过当前网络联系校园网服务器",
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock =>
+                        "等待校园网服务器回复超时",
+                    io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionRefused => "与校园网服务器的连接中断",
+                    _ => "网络通信失败，请复制检测结果以便排查",
+                }
             ),
-            Self::Transport(kind) => write!(f, "套接字错误：{kind:?}"),
-            Self::Challenge(reason) => write!(f, "挑战失败：{reason}"),
-            Self::Credentials(error) => write!(f, "账号或密码长度不合法：{error:?}"),
+            Self::Challenge(reason) => write!(f, "无法开始登录：{reason}"),
+            Self::Credentials(error) => write!(
+                f,
+                "{}",
+                match error {
+                    BuildError::PasswordTooLong =>
+                        "密码过长，本客户端最多支持 16 字节，请检查是否误填了其他密码",
+                    BuildError::UsernameTooLong =>
+                        "账号过长，本客户端最多支持 36 字节，请检查账号是否填写正确",
+                }
+            ),
             Self::Rejected(failure) => match failure.message_text() {
                 // The server usually explains itself; that text is far more
                 // useful than the numeric code it arrives with.
                 Some(text) => write!(f, "{text}（错误码 {}）", failure.code),
                 None => write!(f, "认证被服务器拒绝，错误码 {}", failure.code),
             },
-            Self::NoResponse(stage) => write!(f, "认证服务器未响应：{stage}"),
+            Self::NoResponse(stage) => write!(
+                f,
+                "{}",
+                match *stage {
+                    "挑战" | "所有物理网卡均未收到有效挑战回复" =>
+                        "登录前未收到校园网服务器回复",
+                    "未检测到可用的物理网卡" =>
+                        "没有找到可用的校园网连接，请检查网线或校园 Wi-Fi",
+                    "下线挑战" => "未收到下线确认，服务器可能暂时保留了登录状态",
+                    "认证" | "登录" => "已联系到校园网服务器，但没有收到登录结果",
+                    "keepalive" | "保活" | "主保活" | "保活 type1" | "保活 type3" =>
+                        "已登录，但后续连接确认未收到回复，连接可能已中断",
+                    _ => "校园网服务器没有回复，或没有找到可用的网络连接",
+                }
+            ),
             Self::Stopped => write!(f, "会话已停止"),
             Self::LogoutPacket(error) => write!(f, "下线报文无法构造：{error:?}"),
             Self::Route(error) => match error {
@@ -131,19 +170,25 @@ impl SessionError {
     /// someone to the network centre for nothing.
     pub fn guidance(&self) -> Option<&'static str> {
         match self {
-            Self::NoResponse(_) => Some("请确认网线已插好或已连上校园 Wi-Fi，然后重试"),
+            Self::NoResponse(_) => Some(
+                "请检查网线或校园 Wi-Fi，再点击“检测网络”；如正在使用手机共享网络或 VPN，也请检查连接是否走了校园网",
+            ),
             // Codes 1, 7 and 11 are the ones that come back carrying the
             // registered IP and MAC, which is what a mismatch looks like.
-            Self::Rejected(failure) if matches!(failure.code, 1 | 7 | 11) => {
-                Some("该账号可能已在其它设备上在线，或本机 IP/MAC 与登记不符")
-            }
+            Self::Rejected(failure) if matches!(failure.code, 1 | 7 | 11) => Some(
+                "该账号可能已在其他设备登录，或这台电脑的网络地址与学校登记信息不一致；请核对设备绑定情况",
+            ),
             Self::Transport(kind) => match kind {
-                io::ErrorKind::AddrInUse => Some("本地端口 61440 同一时刻只能被一个客户端占用"),
+                io::ErrorKind::AddrInUse => Some(
+                    "请将配置文件中的 local_port 改为 0，让系统自动选择可用端口，然后重新打开客户端",
+                ),
                 io::ErrorKind::NetworkDown
                 | io::ErrorKind::NetworkUnreachable
                 | io::ErrorKind::AddrNotAvailable => Some("网卡地址可能已变化，请点“刷新”后重试"),
-                io::ErrorKind::PermissionDenied => Some("请以管理员身份运行"),
-                _ => None,
+                io::ErrorKind::PermissionDenied => Some(
+                    "若配置了固定端口，请将 local_port 改为 0 后重启；若仍失败，请检查安全软件是否允许本程序联网",
+                ),
+                _ => Some("请先点击“检测网络”，若仍无法登录，可将检测结果交给校园网服务人员"),
             },
             Self::Route(RouteError::AccessDenied) => Some("添加认证服务器路由需要管理员权限"),
             Self::Challenge(_) => {
@@ -155,9 +200,11 @@ impl SessionError {
             Self::LogoutPacket(_) => {
                 Some("下线报文构造失败，服务端会话可能仍保留，通常会在超时后自行释放")
             }
-            // The server's own message is the guidance for a plain rejection, and
-            // any other route failure has to be read from the error text itself.
-            Self::Rejected(_) | Self::Route(_) | Self::Stopped => None,
+            // Preserve the server reason and add a next step when it gives no remedy.
+            Self::Rejected(_) => Some(
+                "请核对账号密码及校园网账户状态；若仍被拒绝，可将提示和错误码交给校园网服务人员",
+            ),
+            Self::Route(_) | Self::Stopped => None,
         }
     }
 }
@@ -238,7 +285,7 @@ impl SessionConfig {
             interface_index: None,
             adapter_mac_override: None,
             servers,
-            server_port: crate::transport::DEFAULT_LOCAL_PORT,
+            server_port: crate::transport::DEFAULT_SERVER_PORT,
             local_ipv4: Ipv4Addr::UNSPECIFIED,
             bind_ipv4: None,
             local_port: crate::transport::DEFAULT_LOCAL_PORT,

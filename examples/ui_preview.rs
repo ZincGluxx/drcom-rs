@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("provide an output PNG path")?;
     let width: f32 = std::env::args().nth(2).unwrap_or("520".into()).parse()?;
-    let height: f32 = std::env::args().nth(3).unwrap_or("390".into()).parse()?;
+    let height: f32 = std::env::args().nth(3).unwrap_or("460".into()).parse()?;
     let app = AppWindow::new()?;
     // 0 = follow the system, 1 = light, 2 = dark (see `Theme.scheme-override`).
     let scheme = match std::env::args().nth(5).as_deref() {
@@ -41,6 +41,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.set_edit_gateway("10.0.0.1".into());
         app.set_edit_dns("1.1.1.1".into());
         app.set_network_message("应用时会请求管理员权限，并可能短暂中断此网卡的连接。".into());
+    }
+    if std::env::args().nth(4).as_deref() == Some("failure") {
+        let failure = "Windows 阻止了客户端使用网络，可能是端口被系统保留或安全软件拦截。请使用自动端口，并检查安全软件是否允许本程序联网。";
+        app.set_status_detail("本次连接未成功，请查看下方说明".into());
+        app.set_last_failure(format!("2026-10-16 10:29:43\n{failure}").into());
+        app.set_campus_result("可以连通（202.198.16.3）".into());
+        app.set_ipv4_result("未收到回复；可能断网或对方不回应 Ping，不能据此判断登录失败".into());
+        app.set_ipv6_result("baidu.com 没有 IPv6 地址，暂时无法检测这条线路".into());
     }
     app.window()
         .set_size(slint::LogicalSize::new(width, height));

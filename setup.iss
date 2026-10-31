@@ -6,10 +6,10 @@
 ;   3. ISCC.exe setup.iss
 ;
 ; 与 C# 版 (setup.iss) 使用不同的 AppId 和安装目录，两者可以共存；
-; 但同一个 UDP 61440 端口只能被其中一个占用，同时运行时后启动的会报错。
+; 本地 UDP 端口默认自动分配；校园网账号仍可能限制同时在线的设备数。
 
 #define MyAppName "DrCom 校园网助手 (Rust)"
-#define MyAppVersion "1.0.3"
+#define MyAppVersion "1.0.4"
 #define MyAppPublisher "ZincGluxx"
 #define MyAppExeName "drcom-campus.exe"
 #define MyAppCliName "drcom-cli.exe"

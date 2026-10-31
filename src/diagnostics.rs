@@ -1,121 +1,204 @@
-//! User-triggered probes.
-use std::{
-    net::{SocketAddr, TcpStream},
-    time::{Duration, Instant},
-};
+//! On-demand connectivity checks. Ping results do not prove login success.
+use std::net::{IpAddr, ToSocketAddrs};
 
-/// Which half of dual-stack a public-internet probe should exercise.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
     V4,
     V6,
 }
 
-/// The hosts the public-internet probes resolve.
-///
-/// Both are domestic dual-stack names that answer on 443 from anywhere in
-/// mainland China. The obvious literals — `1.1.1.1` and
-/// `2606:4700:4700::1111` — are filtered inside China: they time out on a
-/// perfectly healthy connection, so probing them turns this health check into a
-/// false alarm that reports *both* families broken while the user browses
-/// normally. It also misleads in the other direction: ICMPv6 to those two
-/// addresses still answers, so an ICMP-only check reports success for a path
-/// that carries no traffic. Reachability has to be measured against a target
-/// that is supposed to answer from here.
-const PUBLIC_V4_HOST: &str = "www.baidu.com";
-const PUBLIC_V6_HOST: &str = "www.taobao.com";
+const CAMPUS_HOST: &str = "jlu.edu.cn";
+// Independent domestic endpoints. HTTPS verifies DNS, TCP, TLS certificate and
+// an HTTP response; a single successful endpoint establishes reachability.
+const PUBLIC_HOSTS: [&str; 2] = ["www.baidu.com", "www.taobao.com"];
 
-pub fn tcp_probe(address: SocketAddr) -> String {
-    let start = Instant::now();
-    match TcpStream::connect_timeout(&address, Duration::from_secs(3)) {
-        // The resolved address is part of the answer: for a dual-stack host it
-        // is the only way for the user to see which of the two paths ran.
-        Ok(_) => format!(
-            "可达 · {} · {} ms",
-            address.ip(),
-            start.elapsed().as_millis()
-        ),
-        Err(error) => format!("未连通 · {} · {:?}", address.ip(), error.kind()),
-    }
-}
-
-/// Resolves a domestic host in one address family and connects to it.
-///
-/// Resolving first is what makes the answer trustworthy: a family that resolves
-/// but cannot carry a connection is a different fault from one that never
-/// resolves at all, and users need to be able to tell those apart. It is also
-/// what a browser does, so "this works" here means the site opens.
-pub fn internet_probe(family: Family) -> String {
-    use std::net::ToSocketAddrs;
-
-    let host = match family {
-        Family::V4 => PUBLIC_V4_HOST,
-        Family::V6 => PUBLIC_V6_HOST,
+pub fn internet_probe(
+    family: Family,
+    adapter: Option<&drcom_campus::adapter::AdapterInfo>,
+) -> String {
+    let Some(adapter) = adapter else {
+        return "未找到网络连接｜请插好网线或连接校园 Wi-Fi 后重试".into();
     };
-    let addresses = match (host, 443u16).to_socket_addrs() {
-        Ok(found) => found.collect::<Vec<_>>(),
-        Err(error) => return format!("域名解析失败 · {:?}", error.kind()),
-    };
-    let wanted = match family {
-        Family::V4 => false,
-        Family::V6 => true,
-    };
-    match addresses.iter().find(|item| item.is_ipv6() == wanted) {
-        Some(target) => {
-            let result = tcp_probe(*target);
-            match family {
-                // A failed IPv6 probe has two very different causes: no routable
-                // address on this machine, or a routable address on a path that
-                // is blocked. The address and error kind alone cannot tell them
-                // apart, and only the second is worth waiting to be fixed.
-                Family::V6 if !result.starts_with("可达") => {
-                    format!("{result} ｜ {}", local_ipv6_state())
-                }
-                _ => result,
-            }
-        }
-        None => match family {
-            Family::V4 => "该域名没有 IPv4 记录".into(),
-            Family::V6 => "该域名没有 IPv6 记录".into(),
+    let source = match family {
+        Family::V4 => IpAddr::V4(adapter.ipv4),
+        Family::V6 => match adapter
+            .details
+            .ipv6
+            .iter()
+            .find(|ip| matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xe000 == 0x2000))
+        {
+            Some(ip) => *ip,
+            None => return "暂无 IPv6 地址｜当前校园网网卡尚未分配可访问外网的 IPv6 地址".into(),
         },
+    };
+    let mut failures = Vec::new();
+    for host in PUBLIC_HOSTS {
+        match https_probe(host, family, source) {
+            Ok(result) => return result,
+            Err(reason) => failures.push(format!("{host}：{reason}")),
+        }
     }
+    format!(
+        "暂时无法确认可达｜{}；检测网卡 {}，源地址 {}。请检查网络，或稍后重试",
+        failures.join("；"),
+        adapter.friendly_name,
+        source
+    )
 }
 
-/// Describes this machine's own IPv6 addresses, to pair with a failed probe.
-fn local_ipv6_state() -> String {
-    let adapters = drcom_campus::adapter::list();
-    let global = drcom_campus::adapter::global_ipv6_count(&adapters);
-    if global > 0 {
-        return format!("本机有 {global} 个全局 IPv6 地址");
-    }
-    if adapters
-        .iter()
-        .any(|adapter| !adapter.details.ipv6.is_empty())
-    {
-        "本机只有链路本地 IPv6 地址".into()
-    } else {
-        "本机没有 IPv6 地址".into()
-    }
-}
-
-pub fn campus_probe(server: std::net::Ipv4Addr) -> String {
+fn https_probe(host: &str, family: Family, source: IpAddr) -> Result<String, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        let curl = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+        )
+        .join("System32")
+        .join("curl.exe");
+        let output = std::process::Command::new(curl)
+            // -q must be first: ignore any user curlrc (proxy/TLS overrides).
+            .args([
+                "-q",
+                if family == Family::V6 { "-6" } else { "-4" },
+                "--noproxy",
+                "*",
+                "--interface",
+                &source.to_string(),
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                "4",
+                "--silent",
+                "--head",
+                "--output",
+                "NUL",
+                "--write-out",
+                "%{http_code} %{remote_ip} %{time_total}",
+                &format!("https://{host}/"),
+            ])
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|_| "系统网络检测组件 curl.exe 不可用".to_string())?;
+        https_result(
+            output.status.code().unwrap_or(-1),
+            &String::from_utf8_lossy(&output.stdout),
+            family,
+            host,
+            source,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (host, family, source);
+        Err("当前系统暂不支持 HTTPS 检测".into())
+    }
+}
+
+fn https_result(
+    exit: i32,
+    output: &str,
+    family: Family,
+    host: &str,
+    source: IpAddr,
+) -> Result<String, String> {
+    if exit != 0 {
+        return Err(match exit {
+            6 => "域名解析失败或没有对应地址",
+            7 => "无法建立连接",
+            28 => "连接超时",
+            35 | 60 => "HTTPS 证书或安全连接验证失败，请检查系统时间或网络拦截",
+            45 => "当前网卡地址不可用，请刷新网络",
+            _ => "未完成 HTTPS 访问",
+        }
+        .to_string()
+            + &format!("（检测代码 {exit}）"));
+    }
+    let fields: Vec<_> = output.split_whitespace().collect();
+    let status = fields
+        .first()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    let remote = fields.get(1).and_then(|value| value.parse::<IpAddr>().ok());
+    let Some(remote) = remote.filter(|ip| {
+        ip.is_ipv6() == (family == Family::V6) && !ip.is_loopback() && !ip.is_unspecified()
+    }) else {
+        return Err("未确认目标地址，无法判断这条线路".into());
+    };
+    if !(100..600).contains(&status) {
+        return Err("未收到有效网站响应".into());
+    }
+    let ms = fields
+        .get(2)
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        * 1000.0;
+    Ok(format!(
+        "可用 · {ms:.0} ms｜HTTPS {host}，HTTP {status}，目标 {remote}，源地址 {source}；已验证安全连接和网站响应"
+    ))
+}
+
+pub fn campus_probe() -> String {
+    ping_host(CAMPUS_HOST, Family::V4)
+}
+
+fn resolve_target(host: &str, family: Family) -> Result<IpAddr, String> {
+    let addresses = (host, 0)
+        .to_socket_addrs()
+        .map_err(|_| format!("无法解析 {host}，请检查 DNS 设置或稍后重试"))?;
+    addresses
+        .into_iter()
+        .find(|ip| ip.is_ipv6() == (family == Family::V6))
+        .map(|address| address.ip())
+        .ok_or_else(|| {
+            format!(
+                "{host} 没有 {} 地址，暂时无法检测这条线路",
+                if family == Family::V6 { "IPv6" } else { "IPv4" }
+            )
+        })
+}
+
+fn ping_host(host: &str, family: Family) -> String {
+    let target = match resolve_target(host, family) {
+        Ok(target) => target,
+        Err(message) => return message,
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let flag = if family == Family::V6 { "-6" } else { "-4" };
         match std::process::Command::new("ping.exe")
-            .args(["-4", "-n", "1", "-w", "2000", &server.to_string()])
+            .args([flag, "-n", "2", "-w", "1500", &target.to_string()])
             .creation_flags(0x08000000)
             .output()
         {
-            Ok(output) if output.status.success() => "ICMP 可达".into(),
-            Ok(_) => "ICMP 未响应（不代表认证不可用）".into(),
-            Err(error) => format!("测试失败：{error}"),
+            // TTL is present only in an IPv4 echo reply; time=/时间= belongs to
+            // an echo reply in both supported Windows languages. Exit status
+            // alone can also be zero for an ICMP destination-unreachable reply.
+            Ok(output) => ping_result(&String::from_utf8_lossy(&output.stdout), target),
+            Err(_) => "无法启动网络检测，请检查系统中的 ping.exe".into(),
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = server;
-        "当前平台不支持校内 ICMP 测试".into()
+        let _ = target;
+        "当前系统暂不支持 Ping 检测".into()
+    }
+}
+
+fn ping_result(output: &str, target: IpAddr) -> String {
+    let lower = output.to_ascii_lowercase();
+    // Match ASCII units too: Chinese Windows emits legacy-encoded Chinese,
+    // but the reply latency's '=…ms' / '<…ms' and TTL survive decoding.
+    let reply = lower.lines().any(|line| {
+        line.contains("ttl=")
+            || (line.contains("ms")
+                && (line.contains('=') || line.contains('<'))
+                && line.contains(&target.to_string()))
+    });
+    if reply {
+        format!("可以连通（{target}）")
+    } else {
+        format!("未收到回复（{target}）；可能断网或对方不回应 Ping，不能据此判断登录失败")
     }
 }
 
@@ -201,38 +284,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_public_probes_never_point_at_targets_blocked_inside_china() {
-        // This is the regression that made a healthy connection report both
-        // families as broken. ICMPv6 to these addresses still answers while TCP
-        // 443 does not, so the mistake is invisible in a ping and only shows up
-        // as a user being told their working network is down.
-        for host in [PUBLIC_V4_HOST, PUBLIC_V6_HOST] {
-            for banned in ["1.1.1.1", "8.8.8.8", "2606:4700", "cloudflare", "google"] {
-                assert!(
-                    !host.contains(banned),
-                    "{host} is unreachable from mainland China and cannot be a probe target"
-                );
-            }
-            assert!(
-                host.ends_with(".com") || host.ends_with(".cn"),
-                "{host} should be a resolvable public name"
-            );
-        }
-        assert_ne!(PUBLIC_V4_HOST, PUBLIC_V6_HOST);
+    fn https_requires_a_valid_response_in_the_requested_family() {
+        let source = "10.0.0.2".parse().unwrap();
+        assert!(
+            https_result(0, "200 1.2.3.4 0.125", Family::V4, "example.com", source)
+                .unwrap()
+                .starts_with("可用 · 125 ms")
+        );
+        assert!(https_result(0, "200 1.2.3.4 0.125", Family::V6, "example.com", source).is_err());
+        assert!(https_result(0, "000 1.2.3.4 0", Family::V4, "example.com", source).is_err());
+        assert!(
+            https_result(60, "000 1.2.3.4 0", Family::V4, "example.com", source)
+                .unwrap_err()
+                .contains("证书")
+        );
+        assert!(
+            https_result(28, "", Family::V4, "example.com", source)
+                .unwrap_err()
+                .contains("超时")
+        );
     }
 
     #[test]
-    fn internet_probe_always_returns_something_the_user_can_read() {
-        // Deliberately tolerant of being offline: the point is that every branch
-        // -- resolved, unresolved, no record for the family -- produces a
-        // message rather than panicking or coming back empty.
-        for family in [Family::V4, Family::V6] {
-            let text = internet_probe(family);
-            assert!(!text.is_empty(), "{family:?} produced nothing");
-            assert!(
-                text.contains('·') || text.contains("记录"),
-                "{family:?} produced an unreadable result: {text}"
-            );
-        }
+    fn unreachable_reply_is_not_success() {
+        let target = "1.2.3.4".parse().unwrap();
+        assert!(
+            ping_result("Reply from 1.2.3.1: Destination host unreachable.", target)
+                .starts_with("未收到回复")
+        );
+        assert!(
+            ping_result("Reply from 1.2.3.4: bytes=32 time<1ms TTL=55", target)
+                .starts_with("可以连通")
+        );
+    }
+
+    #[test]
+    fn ipv6_reply_and_timeout_are_distinct() {
+        let target = "2001:db8::1".parse().unwrap();
+        assert!(ping_result("Reply from 2001:db8::1: time=20ms", target).starts_with("可以连通"));
+        assert!(ping_result("来自 2001:db8::1 的回复: 时间=20ms", target).starts_with("可以连通"));
+        assert!(ping_result("Request timed out.", target).starts_with("未收到回复"));
     }
 }

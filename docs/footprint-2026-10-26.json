@@ -1,0 +1,65 @@
+{
+  "measured_at": "2026-10-26T12:51:17+08:00",
+  "process": "drcom-campus",
+  "version": "1.0.4",
+  "platform": "Windows x64",
+  "state": "Existing running client; authentication state not inspected; no restart or login performed.",
+  "method": "System.Diagnostics.Process; 10 samples approximately 500 ms apart; median memory values; MiB = 1048576 bytes.",
+  "sample_count": 10,
+  "working_set_mib": 23.95,
+  "private_commit_mib": 5.56,
+  "threads_min": 4.0,
+  "threads_max": 4.0,
+  "samples": [
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    },
+    {
+      "working_set_bytes": 25112576,
+      "private_commit_bytes": 5832704,
+      "threads": 4
+    }
+  ]
+}

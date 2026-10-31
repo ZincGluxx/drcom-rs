@@ -66,17 +66,27 @@ export component AppTray inherits SystemTrayIcon {
 export component AppWindow inherits Window {
     title: "DrCom 校园网助手";
     icon: @image-url("../assets/icon-128.png");
-    preferred-width: 520px;
-    preferred-height: 390px;
+    preferred-width: 480px;
+    preferred-height: 380px;
     min-width: 480px;
-    min-height: 360px;
+    min-height: 380px;
+    max-width: 480px;
+    max-height: 380px;
     default-font-family: "Microsoft YaHei UI";
     default-font-size: 11px;
     background: Theme.window-background;
     in-out property <string> username;
     in-out property <string> password;
     in-out property <string> connection-state: "未连接";
-    in-out property <string> status-detail: "正在检测物理网卡…";
+    in-out property <string> status-detail: "正在查找可用的网络连接…";
+    in-out property <string> last-failure: "本次运行尚未发生连接问题";
+    in-out property <string> last-failure-stage: "--";
+    in-out property <string> last-failure-code: "--";
+    in-out property <string> last-failure-time: "--";
+    in-out property <string> last-failure-duration: "--";
+    in-out property <string> last-failure-retry: "--";
+    in-out property <bool> failure-details-expanded: false;
+    in-out property <string> campus-page-status: "网页状态尚未检测";
     in-out property <string> adapter-name: "尚未选择";
     in-out property <string> ipv4-address: "--";
     in-out property <string> mac-address: "--";
@@ -117,6 +127,7 @@ export component AppWindow inherits Window {
     callback system-network-requested();
     callback apply-network-requested(string, string, string, string);
     callback save-requested(string, string, bool, bool, bool, bool);
+    callback clear-password-requested();
 
     ScrollView {
         visible: !root.network-editor-visible;
@@ -142,8 +153,8 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         horizontal-stretch: 1;
                         Text { text: "DrCom 校园网助手"; color: Theme.heading-text; font-size: 14px; font-weight: 600; }
-                        Caption { text: root.status-detail; }
-                        if root.session-active : Caption { text: root.online ? "保活运行中 · " + root.duration : "挑战 › 认证 › 保活"; }
+                        Text { text: root.status-detail; color: Theme.body-text; font-size: 11px; wrap: word-wrap; }
+                        if root.session-active : Caption { text: root.online ? "已在线 " + root.duration : "正在为你连接校园网…"; }
                     }
                     Text { text: "● " + root.connection-state; color: root.online ? Theme.online-text : Theme.muted-text; font-size: 11px; vertical-alignment: center; }
                     Action {
@@ -189,8 +200,10 @@ export component AppWindow inherits Window {
                             CheckBox { height: 22px; text: "关闭到托盘"; width: 100px; checked <=> root.minimize-to-tray; }
                         }
                         Action { text: "保存设置"; enabled: !root.session-active; clicked => { root.save-requested(root.username, root.password, root.auto-login, root.auto-reconnect, root.start-with-windows, root.minimize-to-tray); } }
+                        Action { text: "清除已保存密码"; clicked => { root.clear-password-requested(); } }
                         Action { text: "网络设置"; enabled: !root.session-active; clicked => { root.network-settings-requested(); } }
                         Caption { text: root.config-status; }
+                        Caption { text: "不修改 drcom.ini 中由你配置的密码。"; }
                         Rectangle { vertical-stretch: 1; background: transparent; }
                     }
                 }
@@ -205,23 +218,42 @@ export component AppWindow inherits Window {
                         }
                         Caption { text: "网卡：" + root.adapter-name; }
                         Text { text: "IPv4：" + root.ipv4-address; color: Theme.body-text; overflow: elide; }
-                        Caption { text: "网关：" + root.gateway; }
-                        Caption { text: "DNS：" + root.dns; }
-                        Caption { text: "IPv6：" + root.ipv6; }
+                        Text { text: root.campus-page-status; color: Theme.muted-text; font-size: 10px; wrap: word-wrap; }
                         Rectangle { height: 1px; background: Theme.divider; }
                         HorizontalLayout {
-                            Action { text: root.probe-busy ? "检测中…" : "双栈体检"; enabled: !root.probe-busy; clicked => { root.probe-requested(2); } }
-                            Action { text: "复制诊断"; clicked => { root.copy-requested(); } }
-                            Action { text: "导出诊断"; clicked => { root.export-requested(); } }
+                            Action { text: root.probe-busy ? "检测中…" : "检测网络"; enabled: !root.probe-busy; clicked => { root.probe-requested(2); } }
                         }
                         HorizontalLayout {
-                            Action { text: "校内测试"; enabled: !root.probe-busy; clicked => { root.probe-requested(0); } }
-                            Action { text: "公网测试"; enabled: !root.probe-busy; clicked => { root.probe-requested(1); } }
+                            Action { text: "复制结果"; clicked => { root.copy-requested(); } }
+                            Action { text: "保存结果"; clicked => { root.export-requested(); } }
                         }
-                        Caption { text: "校内：" + root.campus-result; }
-                        Caption { text: "IPv4：" + root.ipv4-result; }
-                        Caption { text: "IPv6：" + root.ipv6-result; }
+                        Text { text: "校内：" + root.campus-result; color: Theme.body-text; font-size: 11px; wrap: word-wrap; }
+                        Text { text: "外网 IPv4：" + root.ipv4-result; color: Theme.body-text; font-size: 11px; wrap: word-wrap; }
+                        Text { text: "外网 IPv6：" + root.ipv6-result; color: Theme.body-text; font-size: 11px; wrap: word-wrap; }
+                        Text { text: "外网通过实际访问网站检测，详细信息可复制查看。"; color: Theme.muted-text; font-size: 11px; wrap: word-wrap; }
                         Rectangle { vertical-stretch: 1; background: transparent; }
+                    }
+                }
+            }
+            if !root.online && root.last-failure != "本次运行尚未发生连接问题" : Surface {
+                VerticalLayout {
+                    padding: 8px; spacing: 4px;
+                    HorizontalLayout {
+                        Text { text: "连接遇到了问题"; color: Theme.heading-text; font-weight: 600; horizontal-stretch: 1; }
+                        Action {
+                            text: root.failure-details-expanded ? "收起详情" : "错误详情";
+                            clicked => { root.failure-details-expanded = !root.failure-details-expanded; }
+                        }
+                    }
+                    Text { text: root.last-failure; color: Theme.body-text; font-size: 11px; wrap: word-wrap; }
+                    if root.failure-details-expanded : VerticalLayout {
+                        spacing: 2px;
+                        Caption { text: "阶段：" + root.last-failure-stage; }
+                        Caption { text: "错误码：" + root.last-failure-code; }
+                        Caption { text: "发生时间：" + root.last-failure-time; }
+                        Caption { text: "本次会话/尝试耗时：" + root.last-failure-duration; }
+                        Caption { text: "重试：" + root.last-failure-retry; }
+                        Text { text: "详情已加入复制和保存的诊断结果。"; color: Theme.muted-text; font-size: 11px; wrap: word-wrap; }
                     }
                 }
             }
@@ -242,23 +274,23 @@ export component AppWindow inherits Window {
         VerticalLayout {
             padding: 16px;
             spacing: 6px;
-            Text { text: "IPv4 静态网络设置"; font-size: 16px; font-weight: 600; color: Theme.heading-text; }
+            Text { text: "校园网地址设置"; font-size: 16px; font-weight: 600; color: Theme.heading-text; }
             Caption { text: "网卡：" + root.edit-adapter-name; }
-            Caption { text: "配置此网卡的 IPv4 地址、网关和 DNS。"; }
+            Caption { text: "按学校提供的信息填写；不确定时，请先咨询校园网服务人员。"; }
             Caption { text: "IPv4 地址"; }
             LineEdit { height: 28px; text <=> root.edit-ip; enabled: !root.network-busy; }
             Caption { text: "子网掩码"; }
             LineEdit { height: 28px; text <=> root.edit-mask; enabled: !root.network-busy; }
             Caption { text: "默认网关"; }
             LineEdit { height: 28px; text <=> root.edit-gateway; enabled: !root.network-busy; }
-            Caption { text: "首选 IPv4 DNS"; }
+            Caption { text: "DNS 服务器（域名解析）"; }
             LineEdit { height: 28px; text <=> root.edit-dns; enabled: !root.network-busy; }
             Text { text: root.network-message; font-size: 11px; color: Theme.accent; wrap: word-wrap; }
             HorizontalLayout {
                 spacing: 6px;
                 Action { text: "返回"; enabled: !root.network-busy; clicked => { root.network-editor-visible = false; } }
                 Action { text: "Windows 设置"; enabled: !root.network-busy; clicked => { root.system-network-requested(); } }
-                Action { text: root.network-busy ? "应用中…" : "应用 IPv4 设置"; primary: true; enabled: !root.network-busy; clicked => { root.apply-network-requested(root.edit-ip, root.edit-mask, root.edit-gateway, root.edit-dns); } }
+                Action { text: root.network-busy ? "应用中…" : "保存网络地址"; primary: true; enabled: !root.network-busy; clicked => { root.apply-network-requested(root.edit-ip, root.edit-mask, root.edit-gateway, root.edit-dns); } }
             }
             Rectangle { vertical-stretch: 1; background: transparent; }
         }
