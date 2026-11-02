@@ -316,5 +316,5 @@ cat <<EOF
   4. 命令行用法：$BIN_DIR/drcom-cli --help
   5. 卸载：重新执行本脚本并加 --uninstall
 
-文档：https://github.com/$REPO/blob/main/docs/linux.md
+文档：https://github.com/$REPO/blob/linux/docs/linux.md
 EOF
