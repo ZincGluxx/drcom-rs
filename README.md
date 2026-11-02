@@ -17,6 +17,11 @@ challenge → login → keep-alive → logout 协议流程，已对真实认证�
 > 同一协议还有一个 C# + Avalonia 实现，见主仓库
 > [drcom-net-client](https://github.com/ZincGluxx/drcom-net-client)。
 
+> **分支说明**：本仓库 `main` / `windows` 分支保留 Windows 版 v1.0.4；
+> **Linux x86_64 移植版（v1.1.0，含静默后台运行与一行安装）在
+> [`linux` 分支](https://github.com/ZincGluxx/drcom-rs/tree/linux)**，
+> 安装教程见该分支的 `docs/install.md`。
+
 ## ✨ 特性
 
 **认证与保活**
