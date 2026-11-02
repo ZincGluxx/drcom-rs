@@ -46,6 +46,7 @@ BIN_DIR=""
 AUTOSTART="auto"
 UNINSTALL=0
 USE_MIRRORS=1
+MODIFY_PATH=1
 EXTRA_MIRROR=""
 BASE_URL="${DRCOM_INSTALL_BASE_URL:-}"
 
@@ -70,6 +71,7 @@ usage() {
   --bin-dir <目录>  自定义二进制安装目录（默认 ~/.local/bin）
   --no-mirror      不使用国内镜像，只直连 github.com
   --mirror <前缀>   额外优先尝试的镜像前缀（如 https://ghproxy.net）
+  --no-modify-path 不自动把 ~/.local/bin 写入 shell 配置（默认会自动加入）
   --uninstall      卸载程序与桌面入口（保留账号配置）
   --help           显示本帮助
 EOF
@@ -97,6 +99,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-mirror)
             USE_MIRRORS=0
+            shift
+            ;;
+        --no-modify-path)
+            MODIFY_PATH=0
             shift
             ;;
         --mirror)
@@ -299,13 +305,43 @@ if ! "$BIN_DIR/drcom-cli" --help >/dev/null 2>&1; then
     warn "drcom-cli 在当前系统上无法运行，可能需要从源码构建（见 docs/linux.md）"
 fi
 
-case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *)
-        printf '\n提示：%s 不在 PATH 中，请把下面一行加入 ~/.bashrc / ~/.zshrc：\n' "$BIN_DIR"
+# 把安装目录写进 shell 配置，否则新用户会在终端里遇到 "drcom-cli: 未找到命令"
+# （图形界面不受影响，桌面入口用的是绝对路径）。只改已经存在的 rc 文件，
+# 用 --no-modify-path 可以关闭这一行为。
+ensure_path_in_shells() {
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) return 0 ;;
+    esac
+    if [ "$MODIFY_PATH" != 1 ]; then
+        printf '\n提示：%s 不在 PATH 中，请自行加入：\n' "$BIN_DIR"
         printf '    export PATH="%s:$PATH"\n\n' "$BIN_DIR"
-        ;;
+        return 0
+    fi
+    local rc updated=0
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        [ -f "$rc" ] || continue
+        if grep -qF 'DrCom 校园网助手：把用户级二进制目录加入 PATH' "$rc" 2>/dev/null; then
+            updated=1
+            continue
+        fi
+        cat >>"$rc" <<EOF
+
+# DrCom 校园网助手：把用户级二进制目录加入 PATH（由安装脚本添加）
+case ":\$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) export PATH="$BIN_DIR:\$PATH" ;;
 esac
+EOF
+        printf '已把 %s 加入 PATH：%s（重新打开终端或执行 source 后生效）\n' "$BIN_DIR" "$rc"
+        updated=1
+    done
+    if [ "$updated" = 0 ]; then
+        printf '\n提示：%s 不在 PATH 中，请手动加入：\n' "$BIN_DIR"
+        printf '    export PATH="%s:$PATH"\n\n' "$BIN_DIR"
+    fi
+}
+
+ensure_path_in_shells
 
 cat <<EOF
 下一步：

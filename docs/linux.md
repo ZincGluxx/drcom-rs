@@ -71,8 +71,10 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/ZincGluxx/drcom
 - `~/.local/share/applications/drcom-campus.desktop`（应用菜单中的“DrCom 校园网助手（Rust）”）
 
 设置了 `XDG_DATA_HOME` / `XDG_BIN_HOME` 时，会放到对应目录下。默认**不会**新增开机自启，
-已存在的自启条目会被升级为 `--silent` 静默启动。如果 `~/.local/bin` 不在 `PATH` 中，
-脚本会提示你加入：
+已存在的自启条目会被升级为 `--silent` 静默启动。安装脚本会自动把 `~/.local/bin`
+写入已存在的 `~/.bashrc` / `~/.zshrc`（幂等，重新打开终端或 `source ~/.bashrc`
+后生效；不想改 shell 配置可加 `--no-modify-path`），否则终端里会提示
+`drcom-cli: 未找到命令`：
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"

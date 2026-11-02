@@ -41,6 +41,7 @@ usage() {
   --autostart       安装并启用静默开机自启（~/.config/autostart，--silent）
   --no-autostart    安装但不创建/删除开机自启（默认：已存在的自启条目会被升级）
   --bin-dir <目录>   自定义二进制安装目录（默认 ~/.local/bin）
+  --no-modify-path  不自动把安装目录写入 ~/.bashrc / ~/.zshrc（默认会自动加入）
   --uninstall       卸载程序与桌面入口（保留账号配置）
   -h, --help        显示本帮助
 
@@ -51,6 +52,7 @@ EOF
 BIN_DIR_OVERRIDE=""
 AUTOSTART="auto"
 UNINSTALL=0
+MODIFY_PATH=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --autostart)
@@ -65,6 +67,10 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || die "--bin-dir 需要一个目录"
             BIN_DIR_OVERRIDE="$2"
             shift 2
+            ;;
+        --no-modify-path)
+            MODIFY_PATH=0
+            shift
             ;;
         --uninstall)
             UNINSTALL=1
@@ -207,13 +213,36 @@ printf '  %s\n' \
     "$ICON_DIR/drcom-campus.png" \
     "$APPS_DIR/drcom-campus.desktop"
 
-printf '\n下一步：\n'
-case ":${PATH:-}:" in
+# 把安装目录写进 shell 配置，否则用户会在终端里遇到 "drcom-cli: 未找到命令"
+# （图形界面不受影响，桌面入口使用绝对路径）。
+ensure_path_in_shells() {
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) return 0 ;;
+    esac
+    if [ "$MODIFY_PATH" != 1 ]; then
+        return 0
+    fi
+    local rc
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        [ -f "$rc" ] || continue
+        if grep -qF 'DrCom 校园网助手：把用户级二进制目录加入 PATH' "$rc" 2>/dev/null; then
+            continue
+        fi
+        cat >>"$rc" <<EOF
+
+# DrCom 校园网助手：把用户级二进制目录加入 PATH（由安装脚本添加）
+case ":\$PATH:" in
     *":$BIN_DIR:"*) ;;
-    *)
-        printf '  1. 把 %s 加入 PATH：export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR"
-        ;;
+    *) export PATH="$BIN_DIR:\$PATH" ;;
 esac
+EOF
+        printf '已把 %s 加入 PATH：%s（重新打开终端或执行 source 后生效）\n' "$BIN_DIR" "$rc"
+    done
+}
+
+ensure_path_in_shells
+
+printf '\n下一步：\n'
 printf '  - 图形界面：从应用菜单启动“DrCom 校园网助手（Rust）”，或直接运行 drcom-campus\n'
 printf '  - 命令行：  drcom-cli --help\n'
 printf '  - 首次使用：在界面中填写校园网账号密码；配置文件模板是发行包里的 drcom.ini.example\n'

@@ -61,8 +61,12 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/ZincGluxx/drcom
 | `--mirror <前缀>` | 额外优先尝试的下载镜像 |
 | `--no-mirror` | 只直连 github.com |
 | `--uninstall` | 卸载程序与桌面入口（保留账号配置） |
+| `--no-modify-path` | 不自动修改 shell 配置（默认会把 `~/.local/bin` 写入已存在的 `~/.bashrc` / `~/.zshrc`） |
 
-如果 `~/.local/bin` 不在 `PATH` 中，把下面一行加入 `~/.bashrc` / `~/.zshrc`：
+安装后脚本会自动把 `~/.local/bin` 加入 PATH（修改已存在的 `~/.bashrc` / `~/.zshrc`，
+带幂等标记，不会重复添加）；**重新打开终端或执行 `source ~/.bashrc` 后生效**，
+之后即可直接运行 `drcom-cli` / `drcom-campus`。如果不想让安装脚本改 shell 配置，
+加 `--no-modify-path`，然后手动把下面一行加入对应 rc 文件：
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
