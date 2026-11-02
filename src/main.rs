@@ -17,6 +17,7 @@ mod ui_backend;
 slint::include_modules!();
 
 use slint::ComponentHandle;
+use slint::winit_030::WinitWindowAccessor;
 
 /// Command line the GUI accepts. A desktop launch passes no arguments and keeps
 /// the window-first behaviour; `--silent` exists for login autostart entries.
@@ -118,6 +119,21 @@ fn main() -> Result<(), slint::PlatformError> {
         tray.on_quit_requested(move || quit_backend.quit());
     }
 
+    // Custom title bar: dragging starts a compositor-side move; the buttons
+    // minimize to the taskbar and close per the "keep running" option.
+    let drag_app = app.as_weak();
+    app.on_drag_window_requested(move || {
+        if let Some(app) = drag_app.upgrade() {
+            let _ = app.window().with_winit_window(|window| {
+                let _ = window.drag_window();
+            });
+        }
+    });
+    let minimize_backend = backend.clone();
+    app.on_minimize_requested(move || minimize_backend.request_minimize());
+    let close_window_backend = backend.clone();
+    app.on_close_window_requested(move || close_window_backend.request_close());
+
     // Slint's default response to the close button is to hide the window. That
     // is only half of what the "关闭到托盘" option means, so the decision is taken
     // here: hide when the option is on, and otherwise hand over to the normal
@@ -128,12 +144,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // unopenable entry in the dock. The quit branch keeps the window until logout.
     let close_backend = backend.clone();
     app.window().on_close_requested(move || {
-        if close_backend.close_to_tray() {
-            slint::CloseRequestResponse::KeepWindowShown
-        } else {
-            close_backend.quit();
-            slint::CloseRequestResponse::KeepWindowShown
-        }
+        close_backend.request_close();
+        slint::CloseRequestResponse::KeepWindowShown
     });
 
     // Launching the executable again surfaces the window that is already

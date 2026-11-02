@@ -1,11 +1,13 @@
 [package]
 name = "drcom-campus"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 build = "build.rs"
 
 [dependencies]
-slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-software", "system-tray"] }
+# `unstable-winit-030` exposes the underlying winit window so the custom title
+# bar can start a compositor-side window drag (Wayland/X11/Windows).
+slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-software", "system-tray", "unstable-winit-030"] }
 
 # The reference client binds the fixed local port 61440 with SO_REUSEADDR, so
 # `std::net::UdpSocket` is not enough: without reuse the bind fails outright

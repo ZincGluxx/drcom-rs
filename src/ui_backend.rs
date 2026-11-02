@@ -705,26 +705,73 @@ impl Backend {
     /// Moves the window out of sight, keeping the process (and an active
     /// session) alive.
     ///
-    /// On Linux the window is minimized instead of hidden. Wayland cannot hide a
-    /// window: winit's `set_visible(false)` is a no-op there and Slint destroys
-    /// the surface instead, which leaves the desktop shell with a stale dock /
-    /// taskbar entry that cannot be opened. A minimized window is a real window
-    /// the compositor can restore, so clicking the dock icon brings the program
-    /// back. Windows keeps the tray-style hide, where hiding is supported.
+    /// With a system tray the window is hidden there (the tray icon is the way
+    /// back). Without one, the window is minimized to the taskbar instead:
+    /// Wayland cannot hide a window, and destroying the surface there leaves the
+    /// desktop shell with a stale, unopenable dock entry. Windows always hides
+    /// into the tray, where hiding is supported.
     fn hide_to_tray(&self, note: &str) {
         self.set_tooltip_text(note);
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.window_backgrounded = true;
+        }
+        let has_tray = self.tray.is_some();
+        let window = self.window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            #[cfg(target_os = "linux")]
+            if has_tray {
+                // Hide to the tray. On Wayland this destroys the surface; the
+                // tray icon stays and "显示主窗口" recreates the window.
+                let _ = window.hide();
+            } else {
+                // No tray: a minimized window is restorable from the taskbar.
+                window.window().set_minimized(true);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = has_tray;
+                let _ = window.hide();
+            }
+        });
+    }
+
+    /// The custom title bar's minimize button.
+    ///
+    /// On a desktop with a tray the window goes to the tray, matching what
+    /// closing does there; without one it minimizes to the taskbar, where the
+    /// window stays restorable.
+    pub fn request_minimize(&self) {
+        if self.tray.is_some() {
+            event_log::record("最小化：最小化到托盘");
+            self.hide_to_tray("已最小化到托盘");
+        } else {
+            event_log::record("最小化：最小化到任务栏");
+            self.minimize_window();
+        }
+    }
+
+    /// Minimizes the window to the taskbar.
+    pub fn minimize_window(&self) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.window_backgrounded = true;
         }
         let window = self.window.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = window.upgrade() {
-                #[cfg(target_os = "linux")]
                 window.window().set_minimized(true);
-                #[cfg(not(target_os = "linux"))]
-                let _ = window.hide();
             }
         });
+    }
+
+    /// The custom title bar's close button: keep running in the background when
+    /// the option asks for it, otherwise start the normal logout-and-exit path.
+    pub fn request_close(&self) {
+        if !self.close_to_tray() {
+            self.quit();
+        }
     }
 
     /// Brings the window back after it was minimized or closed to the background.

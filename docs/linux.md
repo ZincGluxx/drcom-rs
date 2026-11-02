@@ -86,16 +86,16 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### 手动下载发布包
 
-发布包文件名形如 `drcom-campus-linux-x86_64-v1.1.1.tar.gz`。从
+发布包文件名形如 `drcom-campus-linux-x86_64-v1.2.0.tar.gz`。从
 <https://github.com/ZincGluxx/drcom-rs/releases/latest> 下载后（国内可用
 `https://ghproxy.net/https://github.com/ZincGluxx/drcom-rs/releases/latest`）：
 
 ```bash
 # 校验（可选，在压缩包所在目录执行）
-sha256sum -c drcom-campus-linux-x86_64-v1.1.1.tar.gz.sha256
+sha256sum -c drcom-campus-linux-x86_64-v1.2.0.tar.gz.sha256
 
-tar xzf drcom-campus-linux-x86_64-v1.1.1.tar.gz
-cd drcom-campus-linux-x86_64-v1.1.1
+tar xzf drcom-campus-linux-x86_64-v1.2.0.tar.gz
+cd drcom-campus-linux-x86_64-v1.2.0
 ./install.sh              # 只安装程序
 ./install.sh --autostart  # 同时启用静默开机自启
 ```
@@ -133,9 +133,13 @@ bash scripts/package-linux.sh     # 产出 dist/ 下的发布包
 
 - **单实例**：程序已在运行时再次启动，会把已运行的窗口唤到前台（Linux 上通过
   `$XDG_RUNTIME_DIR` 下的 Unix 域套接字实现）。
-- **关闭行为**：勾选“关闭到托盘”（没有托盘时显示为“关闭后静默运行”）时，关闭按钮把
-  窗口**最小化**但继续保活：有托盘时图标常驻、可从托盘菜单退出；没有托盘时窗口最小化到
-  任务栏，点击任务栏图标或再次启动本程序即可唤回来。取消勾选后关闭按钮直接退出。
+- **自绘标题栏**：窗口不使用系统原生标题栏，标题栏由程序绘制：拖动标题栏移动窗口；
+  左侧显示应用名，右侧 `—` 最小化（有托盘 → 托盘，无托盘 → 任务栏）、`×` 关闭
+  （按下面的“关闭行为”处理）。
+- **关闭行为**：勾选“关闭到托盘”（没有托盘时显示为“关闭后静默运行”，默认开启）时，
+  关闭按钮让程序**在后台静默运行**：有托盘时窗口隐藏到托盘，托盘菜单可唤回或退出；
+  没有托盘时窗口最小化到任务栏，点击任务栏图标或再次启动本程序即可唤回。
+  取消勾选后关闭按钮直接退出。
 - **静默启动**：`drcom-campus --silent` 启动后不显示窗口，按已保存的账号与“自动登录”设置
   在后台完成认证并持续保活；之后再次运行 `drcom-campus` 会唤出窗口。
 - **认证网卡记忆**：登录成功后记住网卡（`adapter.json`），重启和重连优先使用；
@@ -209,12 +213,13 @@ drcom-campus --silent          # 或 DRCOM_SILENT=1 drcom-campus
 窗口唤出**（单实例机制）。
 
 在界面中勾选“开机启动”后，写入的 autostart 条目会自动带 `--silent`，因此登录桌面时
-不会弹窗，而是直接在后台登录。没有托盘图标时（例如未装 AppIndicator 扩展的 GNOME），
-关闭窗口会**最小化到任务栏**并在后台继续保活，而不是退出：
+不会弹窗，而是直接在后台登录。关闭窗口时程序继续在后台静默运行：
 
-- 唤回窗口：点击任务栏里的程序图标，或再次启动 `drcom-campus`（或从应用菜单启动）。
-- 彻底退出：唤回窗口后取消勾选“关闭后静默运行”，再点关闭按钮。
-- 有托盘时：关闭窗口最小化到托盘/任务栏，从托盘菜单或任务栏退出。
+- 有托盘（KDE、装了 AppIndicator 扩展的 GNOME 等）：窗口隐藏到托盘，托盘菜单可唤回/退出；
+  点击标题栏的 `—` 同样最小化到托盘。
+- 没有托盘（例如未装扩展的 GNOME）：窗口最小化到任务栏，点击任务栏图标或再次启动
+  `drcom-campus` 即可唤回。
+- 彻底退出：唤回窗口后取消勾选“关闭后静默运行”，再点关闭按钮，或从托盘菜单退出。
 
 ### 命令行
 
@@ -291,7 +296,7 @@ sudo pacman -S --needed gnome-shell-extension-appindicator
 
 安装后在“扩展”中启用 “AppIndicator and KStatusNotifierItem Support”，必要时注销并重新登录。
 
-没有托盘时，关闭窗口会最小化到任务栏并继续保活（v1.1.1 起不再使用“隐藏窗口”，避免
+没有托盘时，关闭窗口会最小化到任务栏并继续保活（v1.2.0 起不再使用“隐藏窗口”，避免
 Wayland 下留下点不开的 dock 项）；点击任务栏图标或重新启动程序即可唤回窗口。想彻底退出，
 先唤回窗口并取消勾选“关闭后静默运行”，再点关闭按钮。
 启动时程序会先询问会话总线是否存在 `org.kde.StatusNotifierWatcher`；没有时直接按无托盘

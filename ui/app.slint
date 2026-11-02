@@ -74,6 +74,10 @@ export component AppWindow inherits Window {
     min-height: 380px;
     max-width: 480px;
     max-height: 380px;
+    // The window is drawn by the application: the native title bar is replaced
+    // by the custom one below so the Client-Side Decoration matches the theme
+    // and the close button can follow the "close means keep running" option.
+    no-frame: true;
     default-font-family: "Microsoft YaHei UI";
     default-font-size: 11px;
     background: Theme.window-background;
@@ -134,9 +138,66 @@ export component AppWindow inherits Window {
     callback apply-network-requested(string, string, string, string);
     callback save-requested(string, string, bool, bool, bool, bool);
     callback clear-password-requested();
+    // Custom title bar: dragging and the two window buttons.
+    callback drag-window-requested();
+    callback minimize-requested();
+    callback close-window-requested();
 
-    ScrollView {
-        visible: !root.network-editor-visible;
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            height: 34px;
+            background: Theme.surface-background;
+            // Dragging the window is handled by the backend through winit's
+            // start-drag request, which works on Wayland and X11 alike.
+            TouchArea {
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down) {
+                        root.drag-window-requested();
+                    }
+                }
+            }
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 6px;
+                spacing: 6px;
+                alignment: center;
+                Rectangle {
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 6px;
+                    background: Theme.brand-mark-background;
+                    Text { text: "D"; color: Theme.brand-mark-text; font-size: 11px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Text { text: "DrCom 校园网助手"; color: Theme.heading-text; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Rectangle {
+                    width: 28px;
+                    height: 22px;
+                    border-radius: 6px;
+                    background: minimizeTouch.has-hover ? Theme.divider : transparent;
+                    Text { text: "—"; color: Theme.body-text; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                    minimizeTouch := TouchArea { clicked => { root.minimize-requested(); } }
+                }
+                Rectangle {
+                    width: 28px;
+                    height: 22px;
+                    border-radius: 6px;
+                    background: closeTouch.has-hover ? Theme.divider : transparent;
+                    Text { text: "×"; color: Theme.body-text; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+                    closeTouch := TouchArea { clicked => { root.close-window-requested(); } }
+                }
+            }
+            Rectangle {
+                height: 1px;
+                width: parent.width;
+                y: parent.height - 1px;
+                background: Theme.divider;
+            }
+        }
+        ScrollView {
+            vertical-stretch: 1;
+            visible: !root.network-editor-visible;
         VerticalLayout {
             padding: 10px;
             spacing: 4px;
@@ -278,7 +339,8 @@ export component AppWindow inherits Window {
             Rectangle { vertical-stretch: 1; background: transparent; }
         }
     }
-    if root.network-editor-visible : ScrollView {
+        if root.network-editor-visible : ScrollView {
+            vertical-stretch: 1;
         VerticalLayout {
             padding: 16px;
             spacing: 6px;
@@ -302,5 +364,6 @@ export component AppWindow inherits Window {
             }
             Rectangle { vertical-stretch: 1; background: transparent; }
         }
+    }
     }
 }
