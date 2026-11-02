@@ -12,3 +12,6 @@ __pycache__/
 # Inno Setup 编译输出
 Output/
 *.exe
+
+# Linux 发布打包产物
+/dist/

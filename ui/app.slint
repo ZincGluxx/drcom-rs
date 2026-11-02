@@ -1,6 +1,6 @@
 import { Button, CheckBox, LineEdit, ScrollView, Palette } from "std-widgets.slint";
 
-// Every colour in this file is derived from the platform colour scheme instead of
+// Every colour in this file is derived from the desktop colour scheme instead of
 // being hard-coded. The built-in widgets (`Button`, `LineEdit`, `CheckBox`) already
 // follow `Palette`, so painting our own cards white left dark mode with dark inputs
 // on white surfaces — white-on-white text and an unreadable password field.
@@ -8,6 +8,8 @@ import { Button, CheckBox, LineEdit, ScrollView, Palette } from "std-widgets.sli
 // `Palette.color-scheme` is the scheme Windows reports for this window: the winit
 // backend reads it at window creation and follows the live `ThemeChanged` event, so
 // switching Windows between light and dark re-paints the window without a restart.
+// The Linux X11 backend reports nothing, and the entry point then asks GNOME/KDE
+// once at start-up and pins `scheme-override` accordingly.
 //
 // Exported so the backend can reach it through the generated `Theme` accessor.
 export global Theme {
@@ -102,9 +104,13 @@ export component AppWindow inherits Window {
     in-out property <bool> auto-login: false;
     in-out property <bool> start-with-windows: false;
     // Mirrors the C# client's "关闭到托盘": with it on, the close button hides the
-    // window and a successful login tucks it into the tray after three seconds;
-    // with it off, closing the window really exits.
+    // window and a successful login tucks it away after three seconds; with it off,
+    // closing the window really exits. On a desktop without a tray (for example
+    // stock GNOME) hiding means "keep running silently in the background" and the
+    // binary has to be started again to surface the window.
     in-out property <bool> minimize-to-tray: true;
+    // Set by the entry point: false when the desktop has no system tray.
+    in-out property <bool> tray-available: true;
     in-out property <string> config-status: "未保存";
     in-out property <bool> session-active: false;
     in-out property <bool> online: false;
@@ -197,7 +203,7 @@ export component AppWindow inherits Window {
                             // Deliberately not disabled during a session: the close
                             // button reads this live, so it applies to the running
                             // session exactly as it does in the C# client.
-                            CheckBox { height: 22px; text: "关闭到托盘"; width: 100px; checked <=> root.minimize-to-tray; }
+                            CheckBox { height: 22px; text: root.tray-available ? "关闭到托盘" : "关闭后静默运行"; width: 100px; checked <=> root.minimize-to-tray; }
                         }
                         Action { text: "保存设置"; enabled: !root.session-active; clicked => { root.save-requested(root.username, root.password, root.auto-login, root.auto-reconnect, root.start-with-windows, root.minimize-to-tray); } }
                         Action { text: "清除已保存密码"; clicked => { root.clear-password-requested(); } }
@@ -262,7 +268,9 @@ export component AppWindow inherits Window {
                     horizontal-stretch: 1;
                     vertical-alignment: center;
                     text: root.minimize-to-tray
-                        ? "登录成功后自动进入托盘；关闭窗口最小化到托盘，可从托盘菜单退出。"
+                        ? (root.tray-available
+                            ? "登录成功后自动进入托盘；关闭窗口最小化到托盘，可从托盘菜单退出。"
+                            : "登录成功后自动隐藏并在后台静默保活；关闭窗口后仍在运行，再次启动可唤出窗口，取消勾选后关闭即退出。")
                         : "登录成功后窗口保持打开；关闭窗口即退出程序。";
                 }
                 Caption { text: "© 2026 ZincGlux"; vertical-alignment: center; }
@@ -289,7 +297,7 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 6px;
                 Action { text: "返回"; enabled: !root.network-busy; clicked => { root.network-editor-visible = false; } }
-                Action { text: "Windows 设置"; enabled: !root.network-busy; clicked => { root.system-network-requested(); } }
+                Action { text: "系统网络设置"; enabled: !root.network-busy; clicked => { root.system-network-requested(); } }
                 Action { text: root.network-busy ? "应用中…" : "保存网络地址"; primary: true; enabled: !root.network-busy; clicked => { root.apply-network-requested(root.edit-ip, root.edit-mask, root.edit-gateway, root.edit-dns); } }
             }
             Rectangle { vertical-stretch: 1; background: transparent; }

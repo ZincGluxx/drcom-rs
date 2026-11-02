@@ -157,8 +157,10 @@ fn page_probe_status(page: CampusPage, failed: bool, outcome: PageProbeOutcome) 
 pub struct Backend {
     window: slint::Weak<AppWindow>,
     /// The tray icon is a separate Slint component, so the only way to keep its
-    /// tooltip in step with the session is to hold a handle to it here.
-    tray: slint::Weak<AppTray>,
+    /// tooltip in step with the session is to hold a handle to it here. It is
+    /// absent when the desktop cannot host a StatusNotifierItem, and the code
+    /// then keeps the window visible instead of hiding it.
+    tray: Option<slint::Weak<AppTray>>,
     shared: Arc<Mutex<Shared>>,
     /// Settings read from `drcom.ini` at startup. The prototype had no place to
     /// keep them, which is why the server list had to come from an environment
@@ -169,7 +171,7 @@ pub struct Backend {
 impl Backend {
     /// Wires the window callbacks, fills the adapter panel, and seeds the login
     /// form from the configuration file.
-    pub fn attach(window: &AppWindow, tray: &AppTray) -> Self {
+    pub fn attach(window: &AppWindow, tray: Option<&AppTray>) -> Self {
         let (settings, complaint) = match load_settings() {
             Ok(settings) => (settings, None),
             Err(message) => (ClientConfig::default(), Some(message)),
@@ -180,7 +182,7 @@ impl Backend {
         }
         let backend = Self {
             window: window.as_weak(),
-            tray: tray.as_weak(),
+            tray: tray.map(|tray| tray.as_weak()),
             shared: Arc::new(Mutex::new(Shared::default())),
             settings: Arc::new(settings),
         };
@@ -333,7 +335,12 @@ impl Backend {
         {
             shared.hide_at = None;
             drop(shared);
-            self.hide_to_tray("登录成功，已在托盘运行");
+            let note = if self.tray.is_some() {
+                "登录成功，已在托盘运行"
+            } else {
+                "登录成功，已在后台静默运行"
+            };
+            self.hide_to_tray(note);
             return;
         }
         if let Some((prefs, deadline)) = shared.pending_auto.clone() {
@@ -686,8 +693,12 @@ impl Backend {
         });
     }
 
-    /// Sends the window to the tray and says so in the tooltip, which is the only
-    /// part of the program still visible once the window is hidden.
+    /// Hides the window, keeping the process (and an active session) alive.
+    ///
+    /// With a tray the tooltip is the visible reminder; without one the window
+    /// simply disappears, and starting the binary again brings it back through
+    /// the single-instance handover. That is the documented "silent background"
+    /// behaviour on desktops such as stock GNOME.
     fn hide_to_tray(&self, note: &str) {
         self.set_tooltip_text(note);
         let window = self.window.clone();
@@ -716,8 +727,13 @@ impl Backend {
             shared.hide_at = None;
         }
         if minimize {
-            event_log::record("关闭窗口：按设置最小化到托盘");
-            self.hide_to_tray("已最小化到托盘");
+            if self.tray.is_some() {
+                event_log::record("关闭窗口：按设置最小化到托盘");
+                self.hide_to_tray("已最小化到托盘");
+            } else {
+                event_log::record("关闭窗口：按设置隐藏窗口并在后台静默保活");
+                self.hide_to_tray("窗口已隐藏，后台静默运行；再次启动可唤出窗口");
+            }
         } else {
             event_log::record("关闭窗口：按设置直接退出");
         }
@@ -729,7 +745,9 @@ impl Backend {
         // Shell tooltips clip a long string without any ellipsis, so the useful
         // part has to be the front of it.
         let note: String = note.chars().take(48).collect();
-        let tray = self.tray.clone();
+        let Some(tray) = self.tray.clone() else {
+            return;
+        };
         let text = format!("DrCom 校园网助手 - {note}");
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(tray) = tray.upgrade() {
@@ -1085,6 +1103,9 @@ impl Backend {
                     let minimize = if let Ok(mut shared) = self.shared.lock() {
                         let now = Instant::now();
                         shared.connected_since = Some(now);
+                        // The option covers both flavors: with a tray the window
+                        // goes to the notification area, without one it simply hides
+                        // and keeps the session alive in the background.
                         let minimize = shared.minimize_to_tray;
                         shared.hide_at = minimize.then(|| now + HIDE_AFTER_LOGIN);
                         minimize
@@ -1095,12 +1116,12 @@ impl Backend {
                     self.set_campus_page_status("此程序 UDP 保活已建立");
                     self.set_connection("已连接", "登录成功，可以使用校园网了");
                     self.set_online_duration("0 秒");
-                    // The window is about to disappear, so the tray has to carry
-                    // the news as well.
-                    self.set_tooltip_text(if minimize {
-                        "已连接，稍后最小化到托盘"
-                    } else {
-                        "已连接，正在保持在线"
+                    // The window is about to disappear, so the tray (when there is
+                    // one) has to carry the news as well.
+                    self.set_tooltip_text(match (minimize, self.tray.is_some()) {
+                        (true, true) => "已连接，稍后最小化到托盘",
+                        (true, false) => "已连接，稍后转入后台静默运行",
+                        (false, _) => "已连接，正在保持在线",
                     });
                 }
                 SessionPhase::KeepAlive => self.set_connection("已连接", "连接正常，正在保持在线"),

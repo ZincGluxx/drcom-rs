@@ -68,11 +68,28 @@ impl UdpTransport {
                 return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        if let Some(index) = interface.and_then(std::num::NonZeroU32::new) {
+            // SO_BINDTOIFINDEX pins the socket to the adapter itself instead of
+            // only to its address, which also keeps a probe from leaking out
+            // through a different NIC. The option needs CAP_NET_RAW, so a
+            // normal user gets `PermissionDenied` here. Binding the source
+            // address below still selects that NIC in practice (the kernel uses
+            // the socket's bound address and the same interface route), so a
+            // permission error must not fail the whole login: fall back to
+            // source-address binding only. Any other error is a real problem and
+            // is propagated.
+            match socket.bind_device_by_index_v4(Some(index)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                Err(error) => return Err(error),
+            }
+        }
+        #[cfg(all(not(windows), not(target_os = "linux")))]
         if interface.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "interface pinning requires Windows",
+                "interface pinning requires Windows or Linux",
             ));
         }
         socket.set_reuse_address(true)?;
@@ -145,5 +162,23 @@ mod tests {
         let (len, source) = b.receive(&mut buffer).unwrap();
         assert_eq!(&buffer[..len], &[1, 2, 3, 4]);
         assert_eq!(source, a.local_addr().unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn interface_pinning_never_turns_a_usable_bind_into_an_error() {
+        // Loopback is the one interface whose index can be discovered without
+        // privileges on every host. Both outcomes must work: with CAP_NET_RAW
+        // the socket is pinned, without it the permission error falls back to
+        // plain source-address binding. Either way the caller gets a socket.
+        let Ok(ifindex) = std::fs::read_to_string("/sys/class/net/lo/ifindex") else {
+            eprintln!("skipped: no /sys/class/net/lo/ifindex on this host");
+            return;
+        };
+        let index: u32 = ifindex.trim().parse().unwrap();
+        let transport =
+            UdpTransport::bind_interface(Ipv4Addr::LOCALHOST, DEFAULT_LOCAL_PORT, Some(index))
+                .unwrap();
+        assert!(transport.local_addr().unwrap().ip().is_loopback());
     }
 }

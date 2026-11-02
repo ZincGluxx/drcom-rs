@@ -99,7 +99,17 @@ fn decode_simplified_chinese(bytes: &[u8]) -> String {
 
 #[cfg(not(windows))]
 fn decode_simplified_chinese(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+    // GBK is the encoding the authentication server speaks, because the original
+    // client is a GBK Windows program; encoding_rs decodes it in pure Rust, so
+    // no system code page is involved.
+    let (text, _, had_errors) = encoding_rs::GBK.decode(bytes);
+    if had_errors {
+        // Not GBK after all: show something readable rather than replacement
+        // characters, which is all a failed GBK decode would produce.
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        text.into_owned()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,7 +240,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn the_gbk_reason_the_server_sends_is_decoded_for_display() {
         // `此账号密码错误，请到自助服务平台修改邮箱密码！`, exactly as the deployment
         // sends it: GBK, because the original client is a GBK Windows program.

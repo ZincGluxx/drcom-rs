@@ -85,16 +85,17 @@ fn local_time() -> LocalTime {
 
 #[cfg(not(windows))]
 fn local_time() -> LocalTime {
-    // Getting local time without a platform call needs a timezone database. This
-    // client only ships for Windows, so the fallback exists only to keep the
-    // module compiling for cross-checks and is deliberately not clever.
+    // chrono resolves the platform's local time zone, so Linux reports the same
+    // wall-clock time the user sees; the Windows branch keeps GetLocalTime.
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
     LocalTime {
-        year: 1970,
-        month: 1,
-        day: 1,
-        hour: 0,
-        minute: 0,
-        second: 0,
+        year: u16::try_from(now.year()).unwrap_or(0),
+        month: now.month() as u16,
+        day: now.day() as u16,
+        hour: now.hour() as u16,
+        minute: now.minute() as u16,
+        second: now.second() as u16,
     }
 }
 
@@ -114,5 +115,32 @@ mod tests {
         assert!(text.contains("] 检测结果 99 下一行"));
         assert_eq!(tail(1).lines().count(), 1);
         assert_eq!(tail(0), "");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn timestamps_come_from_the_local_clock_not_the_epoch() {
+        let stamp = timestamp();
+        assert_eq!(
+            stamp.len(),
+            19,
+            "the format is YYYY-MM-DD HH:MM:SS: {stamp}"
+        );
+        assert!(
+            !stamp.starts_with("1970"),
+            "the Unix clock stub must not come back: {stamp}"
+        );
+        let compact = compact_timestamp();
+        assert_eq!(
+            compact.len(),
+            15,
+            "the format is YYYYMMDD-HHMMSS: {compact}"
+        );
+        assert!(
+            compact
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '-'),
+            "the compact stamp must contain no separators but its dash: {compact}"
+        );
     }
 }

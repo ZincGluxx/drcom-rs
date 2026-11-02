@@ -89,8 +89,38 @@ fn https_probe(host: &str, family: Family, source: IpAddr) -> Result<String, Str
     }
     #[cfg(not(windows))]
     {
-        let _ = (host, family, source);
-        Err("当前系统暂不支持 HTTPS 检测".into())
+        // Same flags as the Windows branch, except that `curl` comes from PATH
+        // and the null sink is /dev/null. `-q` stays first so a user curlrc
+        // cannot inject a proxy or skip certificate checks.
+        let output = std::process::Command::new("curl")
+            .args([
+                "-q",
+                if family == Family::V6 { "-6" } else { "-4" },
+                "--noproxy",
+                "*",
+                "--interface",
+                &source.to_string(),
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                "4",
+                "--silent",
+                "--head",
+                "--output",
+                "/dev/null",
+                "--write-out",
+                "%{http_code} %{remote_ip} %{time_total}",
+                &format!("https://{host}/"),
+            ])
+            .output()
+            .map_err(|_| "系统网络检测组件 curl 不可用".to_string())?;
+        https_result(
+            output.status.code().unwrap_or(-1),
+            &String::from_utf8_lossy(&output.stdout),
+            family,
+            host,
+            source,
+        )
     }
 }
 
@@ -180,8 +210,17 @@ fn ping_host(host: &str, family: Family) -> String {
     }
     #[cfg(not(windows))]
     {
-        let _ = target;
-        "当前系统暂不支持 Ping 检测".into()
+        // iputils' ping: -c 2 -W 1, and family selection that also works for
+        // busybox/BSD ping. A non-zero exit only means the echo was not
+        // answered; stdout still tells the user what happened.
+        let flag = if family == Family::V6 { "-6" } else { "-4" };
+        match std::process::Command::new("ping")
+            .args([flag, "-c", "2", "-W", "1", &target.to_string()])
+            .output()
+        {
+            Ok(output) => ping_result(&String::from_utf8_lossy(&output.stdout), target),
+            Err(_) => "无法启动网络检测，请检查系统中的 ping".into(),
+        }
     }
 }
 
@@ -215,9 +254,24 @@ pub fn open_network_settings() -> std::io::Result<()> {
     }
     #[cfg(not(windows))]
     {
+        // Delegate privileged IPv4/DNS edits to whichever network UI this
+        // desktop actually ships, best match first.
+        for (program, arguments) in [
+            ("gnome-control-center", &["network"][..]),
+            ("systemsettings", &["kcm_networkmanagement"][..]),
+            ("nm-connection-editor", &[][..]),
+        ] {
+            if std::process::Command::new(program)
+                .args(arguments)
+                .spawn()
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
         Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "请打开系统网络设置",
+            std::io::ErrorKind::NotFound,
+            "未找到网络设置程序｜请安装 GNOME 设置、KDE 系统设置或 NetworkManager",
         ))
     }
 }
@@ -229,12 +283,55 @@ pub fn copy(text: &str) -> std::io::Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let _ = text;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "剪贴板暂不支持当前平台",
-        ))
+        copy_linux(text)
     }
+}
+
+/// Clipboard programs in the order they are tried: Wayland first, then the two
+/// X11 conventions. A program that is not installed is skipped.
+#[cfg(not(windows))]
+fn clipboard_commands() -> [(&'static str, &'static [&'static str]); 3] {
+    [
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ]
+}
+
+#[cfg(not(windows))]
+fn copy_linux(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    for (program, arguments) in clipboard_commands() {
+        let child = std::process::Command::new(program)
+            .args(arguments)
+            .stdin(std::process::Stdio::piped())
+            // The tools print "no display server" chatter; it is not useful
+            // here and would only pollute the GUI's own log.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take()
+            && stdin.write_all(text.as_bytes()).is_err()
+        {
+            // The tool gave up before reading (no Wayland/X display): that is a
+            // reason to try the next candidate, not to fail the copy.
+            let _ = child.kill();
+            let _ = child.wait();
+            continue;
+        }
+        // wl-copy/xclip/xsel fork by default, so the parent exiting 0 means the
+        // selection was taken over; waiting cannot block the caller.
+        if child.wait().is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "未找到剪贴板工具｜请安装 wl-clipboard（Wayland）或 xclip（X11）",
+    ))
 }
 
 /// Writes the diagnostics text to a timestamped file beside the event log and
@@ -271,11 +368,10 @@ pub fn reveal(directory: &std::path::Path) -> std::io::Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let _ = directory;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "当前平台无法打开文件夹",
-        ))
+        std::process::Command::new("xdg-open")
+            .arg(directory)
+            .spawn()?;
+        Ok(())
     }
 }
 
@@ -324,5 +420,43 @@ mod tests {
         assert!(ping_result("Reply from 2001:db8::1: time=20ms", target).starts_with("可以连通"));
         assert!(ping_result("来自 2001:db8::1 的回复: 时间=20ms", target).starts_with("可以连通"));
         assert!(ping_result("Request timed out.", target).starts_with("未收到回复"));
+    }
+
+    #[test]
+    fn iputils_replies_are_recognised() {
+        // Linux `ping` output, which is what the non-Windows branch parses.
+        let target = "10.100.61.3".parse().unwrap();
+        assert!(
+            ping_result(
+                "64 bytes from 10.100.61.3: icmp_seq=1 ttl=55 time=1.23 ms",
+                target
+            )
+            .starts_with("可以连通")
+        );
+        assert!(
+            ping_result(
+                "From 10.100.61.3 icmp_seq=1 Destination Host Unreachable",
+                target
+            )
+            .starts_with("未收到回复"),
+            "an ICMP unreachable must not read as a working line"
+        );
+        assert!(
+            ping_result(
+                "2 packets transmitted, 0 received, 100% packet loss",
+                target
+            )
+            .starts_with("未收到回复")
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn clipboard_tools_are_tried_in_fallback_order() {
+        assert_eq!(
+            clipboard_commands().map(|(program, _)| program),
+            ["wl-copy", "xclip", "xsel"],
+            "Wayland first, then the two X11 traditions"
+        );
     }
 }

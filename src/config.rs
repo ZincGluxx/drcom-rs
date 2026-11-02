@@ -299,7 +299,8 @@ pub fn load(path: &Path) -> Result<ClientConfig, LoadError> {
 }
 
 /// Looks for `drcom.ini` next to the executable, then in the working directory,
-/// then under `%APPDATA%\DrComCampus`.
+/// then under `%APPDATA%\DrComCampus` on Windows or
+/// `$XDG_CONFIG_HOME/drcom-campus` (default `~/.config/drcom-campus`) on Unix.
 ///
 /// The search stops at the first file that exists, so a per-user copy is only
 /// consulted when no machine-wide one is present. Returns `None` when no
@@ -313,14 +314,46 @@ pub fn discover() -> Option<PathBuf> {
         candidates.push(directory.join(DEFAULT_FILE_NAME));
     }
     candidates.push(PathBuf::from(DEFAULT_FILE_NAME));
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        candidates.push(
-            PathBuf::from(appdata)
-                .join(APP_DATA_DIR)
-                .join(DEFAULT_FILE_NAME),
-        );
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            candidates.push(
+                PathBuf::from(appdata)
+                    .join(APP_DATA_DIR)
+                    .join(DEFAULT_FILE_NAME),
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        candidates.extend(user_config_file());
     }
     candidates.into_iter().find(|path| path.is_file())
+}
+
+/// The per-user configuration file on Unix:
+/// `$XDG_CONFIG_HOME/drcom-campus/drcom.ini`, defaulting to
+/// `~/.config/drcom-campus/drcom.ini`.
+#[cfg(not(windows))]
+fn user_config_file() -> Option<PathBuf> {
+    user_config_file_from(
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    )
+}
+
+/// XDG resolution, split from the environment so the fallback chain is testable.
+#[cfg(not(windows))]
+fn user_config_file_from(
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let base = xdg_config_home.or_else(|| home.map(|home| home.join(".config")))?;
+    Some(base.join("drcom-campus").join(DEFAULT_FILE_NAME))
 }
 
 #[cfg(test)]
@@ -439,5 +472,26 @@ mod tests {
     fn file_servers_win_over_the_environment() {
         let config = parse("auth_server=10.0.0.9\n").expect("valid");
         assert_eq!(config.servers_or_env(), vec![Ipv4Addr::new(10, 0, 0, 9)]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_user_config_lives_under_xdg_config_home() {
+        let home = PathBuf::from("/home/someone");
+        assert_eq!(
+            user_config_file_from(Some(PathBuf::from("/xdg/config")), Some(home.clone())),
+            Some(PathBuf::from("/xdg/config/drcom-campus/drcom.ini"))
+        );
+        assert_eq!(
+            user_config_file_from(None, Some(home)),
+            Some(PathBuf::from(
+                "/home/someone/.config/drcom-campus/drcom.ini"
+            ))
+        );
+        assert_eq!(
+            user_config_file_from(None, None),
+            None,
+            "without XDG_CONFIG_HOME or HOME there is no per-user candidate"
+        );
     }
 }
