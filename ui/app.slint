@@ -269,8 +269,8 @@ export component AppWindow inherits Window {
                     vertical-alignment: center;
                     text: root.minimize-to-tray
                         ? (root.tray-available
-                            ? "登录成功后自动进入托盘；关闭窗口最小化到托盘，可从托盘菜单退出。"
-                            : "登录成功后自动隐藏并在后台静默保活；关闭窗口后仍在运行，再次启动可唤出窗口，取消勾选后关闭即退出。")
+                            ? "登录成功后自动最小化到托盘/任务栏；关闭窗口最小化到托盘，可从托盘菜单退出。"
+                            : "登录成功后自动最小化到任务栏并在后台保活；点击任务栏图标或再次启动可唤出窗口，取消勾选后关闭即退出。")
                         : "登录成功后窗口保持打开；关闭窗口即退出程序。";
                 }
                 Caption { text: "© 2026 ZincGlux"; vertical-alignment: center; }

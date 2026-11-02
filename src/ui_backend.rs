@@ -88,6 +88,11 @@ struct Shared {
     probing: bool,
     edit_adapter: Option<adapter::AdapterInfo>,
     network_busy: bool,
+    /// True while the window is deliberately out of sight: minimized to the
+    /// taskbar/tray, hidden, or never shown because the program started with
+    /// `--silent`. Surfacing the window has to recreate it on Wayland, where the
+    /// compositor ignores client-side unminimize requests.
+    window_backgrounded: bool,
 }
 
 impl Default for Shared {
@@ -105,6 +110,7 @@ impl Default for Shared {
             probing: false,
             edit_adapter: None,
             network_busy: false,
+            window_backgrounded: true,
         }
     }
 }
@@ -171,7 +177,7 @@ pub struct Backend {
 impl Backend {
     /// Wires the window callbacks, fills the adapter panel, and seeds the login
     /// form from the configuration file.
-    pub fn attach(window: &AppWindow, tray: Option<&AppTray>) -> Self {
+    pub fn attach(window: &AppWindow, tray: Option<&AppTray>, start_hidden: bool) -> Self {
         let (settings, complaint) = match load_settings() {
             Ok(settings) => (settings, None),
             Err(message) => (ClientConfig::default(), Some(message)),
@@ -183,7 +189,10 @@ impl Backend {
         let backend = Self {
             window: window.as_weak(),
             tray: tray.map(|tray| tray.as_weak()),
-            shared: Arc::new(Mutex::new(Shared::default())),
+            shared: Arc::new(Mutex::new(Shared {
+                window_backgrounded: start_hidden,
+                ..Shared::default()
+            })),
             settings: Arc::new(settings),
         };
         event_log::record(&format!(
@@ -336,9 +345,9 @@ impl Backend {
             shared.hide_at = None;
             drop(shared);
             let note = if self.tray.is_some() {
-                "登录成功，已在托盘运行"
+                "登录成功，已最小化到托盘"
             } else {
-                "登录成功，已在后台静默运行"
+                "登录成功，已最小化到任务栏并在后台保活"
             };
             self.hide_to_tray(note);
             return;
@@ -693,20 +702,68 @@ impl Backend {
         });
     }
 
-    /// Hides the window, keeping the process (and an active session) alive.
+    /// Moves the window out of sight, keeping the process (and an active
+    /// session) alive.
     ///
-    /// With a tray the tooltip is the visible reminder; without one the window
-    /// simply disappears, and starting the binary again brings it back through
-    /// the single-instance handover. That is the documented "silent background"
-    /// behaviour on desktops such as stock GNOME.
+    /// On Linux the window is minimized instead of hidden. Wayland cannot hide a
+    /// window: winit's `set_visible(false)` is a no-op there and Slint destroys
+    /// the surface instead, which leaves the desktop shell with a stale dock /
+    /// taskbar entry that cannot be opened. A minimized window is a real window
+    /// the compositor can restore, so clicking the dock icon brings the program
+    /// back. Windows keeps the tray-style hide, where hiding is supported.
     fn hide_to_tray(&self, note: &str) {
         self.set_tooltip_text(note);
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.window_backgrounded = true;
+        }
         let window = self.window.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = window.upgrade() {
+                #[cfg(target_os = "linux")]
+                window.window().set_minimized(true);
+                #[cfg(not(target_os = "linux"))]
                 let _ = window.hide();
             }
         });
+    }
+
+    /// Brings the window back after it was minimized or closed to the background.
+    ///
+    /// On Wayland the client cannot unminimize its own window (winit ignores the
+    /// request and reports no visibility state), so the reliable way back is to
+    /// recreate the surface: Slint destroys it on `hide()` there, and `show()`
+    /// maps a fresh, visible window. Elsewhere a plain `show()` is enough.
+    pub fn surface_window(&self) {
+        let backgrounded = self
+            .shared
+            .lock()
+            .map(|mut shared| {
+                let backgrounded = shared.window_backgrounded;
+                shared.window_backgrounded = false;
+                backgrounded
+            })
+            .unwrap_or(true);
+        let window = self.window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            #[cfg(target_os = "linux")]
+            if backgrounded {
+                let _ = window.window().hide();
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = backgrounded;
+            let _ = window.show();
+        });
+    }
+
+    /// Records that the window is visible again, so a later activation does not
+    /// recreate a window that is already on screen.
+    pub fn note_window_shown(&self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.window_backgrounded = false;
+        }
     }
 
     /// Handles the window's close button. Returns `true` when the window should
@@ -729,10 +786,10 @@ impl Backend {
         if minimize {
             if self.tray.is_some() {
                 event_log::record("关闭窗口：按设置最小化到托盘");
-                self.hide_to_tray("已最小化到托盘");
+                self.hide_to_tray("已最小化到托盘/任务栏");
             } else {
-                event_log::record("关闭窗口：按设置隐藏窗口并在后台静默保活");
-                self.hide_to_tray("窗口已隐藏，后台静默运行；再次启动可唤出窗口");
+                event_log::record("关闭窗口：按设置最小化到任务栏并在后台保活");
+                self.hide_to_tray("已最小化到任务栏，后台静默运行；点击任务栏图标或再次启动可唤出");
             }
         } else {
             event_log::record("关闭窗口：按设置直接退出");

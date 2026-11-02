@@ -80,7 +80,7 @@ export PATH="$HOME/.local/bin:$PATH"
    - **自动登录**：启动时用保存的账号密码自动认证；
    - **自动重连**：掉线后自动恢复（默认开）；
    - **开机启动**：登录桌面时自动运行（配合 `--silent` 即静默登录）；
-   - **关闭到托盘** / **关闭后静默运行**：关闭窗口后继续在后台保活。
+   - **关闭到托盘** / **关闭后静默运行**：关闭窗口后最小化到托盘/任务栏并在后台保活。
 4. 点 **保存设置**。看到“网络概览”里有网卡、IPv4、网关即表示环境就绪，点 **连接** 即可上网。
 
 > 配置文件位置（可选）：`~/.config/drcom-campus/drcom.ini`。不写这个文件也能用，
@@ -90,7 +90,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 - 勾选“自动登录”后，用 `drcom-campus --silent` 启动：不显示窗口，直接在后台认证并保活。
 - 开机自启条目默认带 `--silent`，登录桌面自动静默认证。
-- 想唤出窗口：再次运行 `drcom-campus`（单实例会唤醒已有窗口）。
+- 想唤出窗口：点击任务栏里的程序图标，或再次运行 `drcom-campus`（单实例会唤醒已有窗口）。
 - 想彻底退出：唤出窗口后取消“关闭后静默运行”，再点关闭按钮。
 
 ## 4. 命令行用法
@@ -152,7 +152,8 @@ DRCOM_INSTALL_BASE_URL=https://your-mirror/drcom bash install.sh
 | --- | --- |
 | 安装脚本下载失败 | 换第 6 节的镜像；或手动从 Releases 下载后执行包内 `install.sh` |
 | `GLIBC_2.xx not found` | 发布包按构建机 glibc 链接；在该系统上从源码构建（见 [linux.md](linux.md)） |
-| 托盘图标不显示（GNOME） | 安装并启用 AppIndicator 扩展；没有托盘时关闭窗口会转为后台静默运行 |
+| 托盘图标不显示（GNOME） | 安装并启用 AppIndicator 扩展；没有托盘时关闭窗口会最小化到任务栏并在后台保活 |
+| 关闭后任务栏出现点不开的窗口 | v1.1.0 在 Wayland 下隐藏窗口会留下失效的 dock 项；升级到 v1.1.1 后关闭改为最小化，点击任务栏图标即可打开 |
 | 界面打不开 | 确认处于桌面会话（`echo $DISPLAY` / `$WAYLAND_DISPLAY`）；无桌面请用 `drcom-cli` |
 | 认证失败 | 用 `drcom-cli --verbose` 看阶段输出；确认账号、服务器地址与网卡 IPv4 |
 | 路由操作权限不足 | 用 `sudo drcom-cli --auth-route-apply`，或保持默认 `auth_route = off` |

@@ -97,7 +97,13 @@ fn main() -> Result<(), slint::PlatformError> {
         None
     };
     app.set_tray_available(tray.is_some());
-    let backend = std::rc::Rc::new(ui_backend::Backend::attach(&app, tray.as_ref()));
+    // Arc rather than Rc: the single-instance worker thread has to call
+    // surface_window(). Every field of Backend is Send + Sync already.
+    let backend = std::sync::Arc::new(ui_backend::Backend::attach(
+        &app,
+        tray.as_ref(),
+        options.silent,
+    ));
     let timer = slint::Timer::default();
     let tick = backend.clone();
     timer.start(
@@ -106,12 +112,8 @@ fn main() -> Result<(), slint::PlatformError> {
         move || tick.tick(),
     );
     if let Some(tray) = &tray {
-        let app_weak = app.as_weak();
-        tray.on_show_requested(move || {
-            if let Some(app) = app_weak.upgrade() {
-                let _ = app.show();
-            }
-        });
+        let show_backend = backend.clone();
+        tray.on_show_requested(move || show_backend.surface_window());
         let quit_backend = backend.clone();
         tray.on_quit_requested(move || quit_backend.quit());
     }
@@ -120,12 +122,14 @@ fn main() -> Result<(), slint::PlatformError> {
     // is only half of what the "关闭到托盘" option means, so the decision is taken
     // here: hide when the option is on, and otherwise hand over to the normal
     // shutdown path — which logs out first and only then ends the event loop.
-    // Returning `KeepWindowShown` is what stops the window disappearing before
-    // that logout finishes.
+    // Returning `KeepWindowShown` in both cases is deliberate: the backend has
+    // already minimized the window, and Slint's own `HideWindow` reaction destroys
+    // the surface on Wayland (winit cannot hide there), which is what left an
+    // unopenable entry in the dock. The quit branch keeps the window until logout.
     let close_backend = backend.clone();
     app.window().on_close_requested(move || {
         if close_backend.close_to_tray() {
-            slint::CloseRequestResponse::HideWindow
+            slint::CloseRequestResponse::KeepWindowShown
         } else {
             close_backend.quit();
             slint::CloseRequestResponse::KeepWindowShown
@@ -135,14 +139,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // Launching the executable again surfaces the window that is already
     // running — which is usually hidden in the tray — instead of adding a
     // second icon nobody can tell apart.
-    let activate_weak = app.as_weak();
+    let activate_backend = backend.clone();
     instance.listen(move || {
-        let app_weak = activate_weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(app) = app_weak.upgrade() {
-                let _ = app.show();
-            }
-        });
+        let backend = activate_backend.clone();
+        let _ = slint::invoke_from_event_loop(move || backend.surface_window());
     });
 
     // Silent start: the window is created (so the session can put login failures
@@ -150,6 +150,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // binary surfaces it through the single-instance handover.
     if !options.silent {
         app.show()?;
+        backend.note_window_shown();
     }
     if let Some(tray) = &tray {
         tray.show()?;
