@@ -33,7 +33,7 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/ZincGluxx/drcom
 ```
 
 安装到当前用户目录（`~/.local`），不需要 root，可重复执行升级，支持 `--uninstall`。
-教程见 [docs/install.md](docs/install.md)，平台细节见 [docs/linux.md](docs/linux.md)。
+教程见 [docs/install.md](https://github.com/ZincGluxx/drcom-rs/blob/linux/docs/install.md)，平台细节见 [docs/linux.md](https://github.com/ZincGluxx/drcom-rs/blob/linux/docs/linux.md)。
 
 ## 📦 发布物
 
