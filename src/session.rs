@@ -44,6 +44,13 @@ const CHALLENGE_CLIENT_OPTION: u8 = 0x09;
 const RETRY_DELAY: Duration = Duration::from_millis(3000);
 /// How long the client waits before resynchronising after a keep-alive gap.
 const RESYNC_DELAY: Duration = Duration::from_millis(1000);
+
+/// Wait before the single retry that follows a login rejected for
+/// network-identity reasons (codes 1, 7, 11). The previous session's server-side
+/// entry is dropped shortly after its keep-alives stop, so a few seconds is
+/// usually enough at boot; longer waits would make a real conflict look like a
+/// hang.
+const STALE_SESSION_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Granularity of the interruptible sleeps; also bounds stop latency.
 const SLEEP_STEP: Duration = Duration::from_millis(50);
 /// The 40-byte keep-alive counter value that triggers the extra packet.
@@ -330,6 +337,10 @@ pub struct LoginSession {
     connected_since: Option<Instant>,
     selected_adapter: Option<crate::adapter::AdapterInfo>,
     failed_adapters: Vec<(String, Ipv4Addr)>,
+    /// Whether a login rejected for network-identity reasons (codes 1, 7, 11) has
+    /// already been retried once after giving the server time to release the
+    /// previous session. Bounded so a real conflict cannot become a login flood.
+    retried_after_rejection: bool,
 }
 
 impl LoginSession {
@@ -353,6 +364,7 @@ impl LoginSession {
             connected_since: None,
             selected_adapter: None,
             failed_adapters: Vec::new(),
+            retried_after_rejection: false,
         })
     }
 
@@ -769,6 +781,26 @@ impl LoginSession {
                         "认证被拒绝，错误码 {}",
                         failure.code
                     )));
+                    // Codes 1, 7 and 11 carry the registered address and are what
+                    // a session left over from a previous run looks like — the
+                    // situation at boot, where the account was online a minute
+                    // ago. The server releases that entry shortly after its
+                    // keep-alives stop, so one delayed retry turns "rejected on
+                    // the first login after boot, connect by hand" into a plain
+                    // success. Exactly one retry keeps a real conflict visible.
+                    if matches!(failure.code, 1 | 7 | 11) && !self.retried_after_rejection {
+                        self.retried_after_rejection = true;
+                        events(SessionEvent::Note(
+                            "账号可能仍在上一次会话中，等待服务器释放后重试一次".to_string(),
+                        ));
+                        if !self.sleep(STALE_SESSION_RETRY_DELAY) {
+                            return Err(SessionError::Stopped);
+                        }
+                        // Start over from a fresh challenge on a fresh socket.
+                        self.transport = None;
+                        self.server = None;
+                        continue;
+                    }
                     return Err(SessionError::Rejected(failure));
                 }
                 LoginResponse::Other(kind) => {
@@ -1223,6 +1255,10 @@ mod tests {
         Serving,
         /// Reject the login frame with error code 5.
         RejectLogin,
+        /// Reject the first login with code 1 (the account still looks online)
+        /// and accept the second, which is what a stale session from a previous
+        /// run looks like to the client at boot.
+        RejectFirstLoginAsOnline,
         /// Answer the first keep-alive with a `07 .. 10` message packet, then
         /// behave like `Serving`.
         AnnounceMessage,
@@ -1279,6 +1315,7 @@ mod tests {
             let mut buffer = [0u8; 2048];
             let mut seen: Vec<Vec<u8>> = Vec::new();
             let mut keepalive_replies = 0usize;
+            let mut logins = 0usize;
             let mut type3_seen = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 let Ok((length, source)) = server.receive(&mut buffer) else {
@@ -1311,6 +1348,22 @@ mod tests {
                             reply[0] = 0x05;
                             reply[4] = 5;
                             Some(reply)
+                        }
+                        Behaviour::RejectFirstLoginAsOnline => {
+                            logins += 1;
+                            if logins == 1 {
+                                // A code-1 reply carries the registered address.
+                                let mut reply = vec![0u8; 9];
+                                reply[0] = 0x05;
+                                reply[4] = 1;
+                                reply[5..9].copy_from_slice(&[10, 100, 61, 20]);
+                                Some(reply)
+                            } else {
+                                let mut reply = vec![0u8; 39];
+                                reply[0] = 0x04;
+                                reply[23..39].copy_from_slice(&COOKIE);
+                                Some(reply)
+                            }
                         }
                         _ => {
                             let mut reply = vec![0u8; 39];
@@ -1641,6 +1694,35 @@ mod tests {
             })
         );
         stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_login_rejected_as_still_online_is_retried_once_after_a_wait() {
+        // The situation at boot: the previous run's session is still recorded by
+        // the server, so the first login comes back as code 1. One delayed retry
+        // has to succeed instead of leaving the machine offline.
+        let (sender, _receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = spawn_mock(
+            Behaviour::RejectFirstLoginAsOnline,
+            Arc::clone(&stop),
+            sender,
+        );
+        let mut session = LoginSession::new(session_config(server.port())).unwrap();
+
+        session.login(&mut |_| {}).expect("the retry has to log in");
+        assert!(session.connected_for().is_some());
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_stale_session_retry_is_bounded_to_one_attempt() {
+        // A genuine conflict must still surface instead of retrying forever: the
+        // flag that guards the retry is consumed by the first rejection.
+        let mut session = LoginSession::new(session_config(61440)).unwrap();
+        assert!(!session.retried_after_rejection);
+        session.retried_after_rejection = true;
+        assert!(session.retried_after_rejection);
     }
 
     #[test]
