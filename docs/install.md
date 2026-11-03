@@ -154,7 +154,7 @@ DRCOM_INSTALL_BASE_URL=https://your-mirror/drcom bash install.sh
 | 安装脚本下载失败 | 换第 6 节的镜像；或手动从 Releases 下载后执行包内 `install.sh` |
 | `GLIBC_2.xx not found` | 发布包按构建机 glibc 链接；在该系统上从源码构建（见 [linux.md](linux.md)） |
 | 托盘图标不显示（GNOME） | 安装并启用 AppIndicator 扩展；没有托盘时关闭窗口会最小化到任务栏并在后台保活 |
-| 关闭后任务栏出现点不开的窗口 | v1.1.0 在 Wayland 下隐藏窗口会留下失效的 dock 项；升级到 v1.2.0 后关闭改为最小化，点击任务栏图标即可打开 |
+| 关闭后任务栏出现点不开的窗口 | v1.1.0 在 Wayland 下隐藏窗口会留下失效的 dock 项；升级到 v1.2.2 后关闭改为最小化，点击任务栏图标即可打开 |
 | 界面打不开 | 确认处于桌面会话（`echo $DISPLAY` / `$WAYLAND_DISPLAY`）；无桌面请用 `drcom-cli` |
 | 认证失败 | 用 `drcom-cli --verbose` 看阶段输出；确认账号、服务器地址与网卡 IPv4 |
 | 路由操作权限不足 | 用 `sudo drcom-cli --auth-route-apply`，或保持默认 `auth_route = off` |

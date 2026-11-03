@@ -118,18 +118,20 @@ impl Default for Shared {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PageProbeOutcome {
     app_session_active: bool,
-    canceled_auto_login: bool,
 }
 
-fn reconcile_page_probe_state(shared: &mut Shared, page: CampusPage) -> PageProbeOutcome {
+/// Merges an informational campus-page probe into the shared state.
+///
+/// The probe only feeds the status line. It deliberately does **not** cancel a
+/// pending auto-login: at boot the authentication session of the previous run
+/// can still be visible on the campus page while the network is not actually
+/// ours, and skipping the login there left the machine offline until the user
+/// opened the window and pressed connect. Logging in is also how the client
+/// takes over its own stale session.
+fn reconcile_page_probe_state(shared: &mut Shared, _page: CampusPage) -> PageProbeOutcome {
     shared.page_probe_pending = false;
-    let app_session_active = shared.stop.is_some() || shared.connected_since.is_some();
-    let canceled_auto_login = !app_session_active
-        && page == CampusPage::CurrentSession
-        && shared.pending_auto.take().is_some();
     PageProbeOutcome {
-        app_session_active,
-        canceled_auto_login,
+        app_session_active: shared.stop.is_some() || shared.connected_since.is_some(),
     }
 }
 
@@ -221,8 +223,10 @@ impl Backend {
                     && !prefs.username.is_empty()
                     && !prefs.password.is_empty()
                 {
+                    // Boot can take a while (DHCP, Wi-Fi association, campus portal),
+                    // so give the auto-login a generous window to find an adapter.
                     backend.shared.lock().unwrap().pending_auto =
-                        Some((prefs, Instant::now() + Duration::from_secs(90)));
+                        Some((prefs, Instant::now() + Duration::from_secs(300)));
                 }
             }
             Err(_) => window.set_config_status("读取失败，请重新保存账号".into()),
@@ -353,9 +357,7 @@ impl Backend {
             return;
         }
         if let Some((prefs, deadline)) = shared.pending_auto.clone() {
-            if shared.page_probe_pending {
-                drop(shared);
-            } else if Instant::now() > deadline {
+            if Instant::now() > deadline {
                 shared.pending_auto = None;
                 drop(shared);
                 self.remember_failure_text("自动登录等待可用网络超时");
@@ -397,15 +399,9 @@ impl Backend {
         } else {
             PageProbeOutcome {
                 app_session_active: false,
-                canceled_auto_login: false,
             }
         };
         self.set_campus_page_status(page_probe_status(page, failed, outcome));
-
-        if outcome.canceled_auto_login {
-            event_log::record("启动网页状态显示已有认证；跳过本次自动登录，未接管外部会话");
-            self.set_status("网页显示已有认证；本程序未接管外部会话，也未启动 UDP 保活");
-        }
     }
 
     fn set_campus_page_status(&self, status: &str) {
@@ -1601,12 +1597,15 @@ mod tests {
     }
 
     #[test]
-    fn external_session_probe_cancels_pending_auto_login_without_starting_our_session() {
+    fn external_session_probe_does_not_cancel_pending_auto_login() {
+        // At boot the campus page can still show the previous run's session even
+        // though no keep-alive is running. Cancelling the auto-login there left
+        // the machine offline; the probe is informational only now.
         let mut shared = Shared {
             page_probe_pending: true,
             pending_auto: Some((
                 Preferences::default(),
-                Instant::now() + Duration::from_secs(90),
+                Instant::now() + Duration::from_secs(300),
             )),
             ..Default::default()
         };
@@ -1614,9 +1613,8 @@ mod tests {
         let outcome = reconcile_page_probe_state(&mut shared, CampusPage::CurrentSession);
 
         assert!(!outcome.app_session_active);
-        assert!(outcome.canceled_auto_login);
         assert!(!shared.page_probe_pending);
-        assert!(shared.pending_auto.is_none());
+        assert!(shared.pending_auto.is_some());
         assert!(shared.stop.is_none());
         assert_eq!(
             page_probe_status(CampusPage::CurrentSession, false, outcome),
@@ -1637,7 +1635,6 @@ mod tests {
         let outcome = reconcile_page_probe_state(&mut shared, CampusPage::CurrentSession);
 
         assert!(outcome.app_session_active);
-        assert!(!outcome.canceled_auto_login);
         assert!(!shared.page_probe_pending);
         assert!(Arc::ptr_eq(shared.stop.as_ref().unwrap(), &stop));
         assert!(!stop.load(Ordering::Relaxed));
@@ -1662,7 +1659,6 @@ mod tests {
         let outcome = reconcile_page_probe_state(&mut shared, CampusPage::LoginForm);
 
         assert!(!outcome.app_session_active);
-        assert!(!outcome.canceled_auto_login);
         assert!(shared.pending_auto.is_some());
     }
 

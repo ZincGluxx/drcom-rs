@@ -75,6 +75,11 @@ fn main() -> Result<(), slint::PlatformError> {
         single_instance::Launch::Duplicate => return Ok(()),
     };
 
+    // Match the installed `drcom-campus.desktop` (also set as StartupWMClass).
+    // Wayland uses this as the xdg-toplevel app_id and X11 as WM_CLASS; without
+    // it GNOME Shell cannot associate the window with the application entry, so
+    // the dock entry can become unopenable and tray interactions look orphaned.
+    let _ = slint::set_xdg_app_id("drcom-campus");
     let app = AppWindow::new()?;
     // The window follows the desktop colour scheme by default; `DRCOM_THEME` pins it
     // instead (0 = auto, 1 = light, 2 = dark), for users whose desktop reports the

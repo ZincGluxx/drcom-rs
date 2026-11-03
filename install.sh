@@ -31,7 +31,7 @@
 set -euo pipefail
 
 REPO="ZincGluxx/drcom-rs"
-DEFAULT_VERSION="1.2.0"
+DEFAULT_VERSION="1.2.2"
 ASSET_PREFIX="drcom-campus-linux-x86_64"
 MIRRORS=(
     "https://ghproxy.net"
@@ -164,6 +164,7 @@ Name=DrCom 校园网助手（Rust）
 Comment=吉林大学 Dr.COM 校园网认证客户端
 Exec=$exec_line
 Icon=drcom-campus
+StartupWMClass=drcom-campus
 Terminal=false
 Categories=Network;
 EOF
@@ -176,6 +177,7 @@ write_autostart_entry() {
 Type=Application
 Name=DrCom 校园网助手
 Exec=$(exec_quote "$BIN_DIR/drcom-campus") --silent
+StartupWMClass=drcom-campus
 Terminal=false
 X-GNOME-Autostart-enabled=true
 EOF

@@ -86,16 +86,16 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### 手动下载发布包
 
-发布包文件名形如 `drcom-campus-linux-x86_64-v1.2.0.tar.gz`。从
+发布包文件名形如 `drcom-campus-linux-x86_64-v1.2.2.tar.gz`。从
 <https://github.com/ZincGluxx/drcom-rs/releases/latest> 下载后（国内可用
 `https://ghproxy.net/https://github.com/ZincGluxx/drcom-rs/releases/latest`）：
 
 ```bash
 # 校验（可选，在压缩包所在目录执行）
-sha256sum -c drcom-campus-linux-x86_64-v1.2.0.tar.gz.sha256
+sha256sum -c drcom-campus-linux-x86_64-v1.2.2.tar.gz.sha256
 
-tar xzf drcom-campus-linux-x86_64-v1.2.0.tar.gz
-cd drcom-campus-linux-x86_64-v1.2.0
+tar xzf drcom-campus-linux-x86_64-v1.2.2.tar.gz
+cd drcom-campus-linux-x86_64-v1.2.2
 ./install.sh              # 只安装程序
 ./install.sh --autostart  # 同时启用静默开机自启
 ```
@@ -296,11 +296,15 @@ sudo pacman -S --needed gnome-shell-extension-appindicator
 
 安装后在“扩展”中启用 “AppIndicator and KStatusNotifierItem Support”，必要时注销并重新登录。
 
-没有托盘时，关闭窗口会最小化到任务栏并继续保活（v1.2.0 起不再使用“隐藏窗口”，避免
-Wayland 下留下点不开的 dock 项）；点击任务栏图标或重新启动程序即可唤回窗口。想彻底退出，
-先唤回窗口并取消勾选“关闭后静默运行”，再点关闭按钮。
-启动时程序会先询问会话总线是否存在 `org.kde.StatusNotifierWatcher`；没有时直接按无托盘
-方式运行，不会再向终端打印托盘创建失败的告警。
+有托盘时关闭窗口会**隐藏到托盘**：dock / 任务栏里不会留下窗口项，只保留托盘图标；
+从托盘菜单“显示主窗口”或再次启动程序即可唤回窗口。没有托盘时退化为最小化到任务栏并
+继续保活。想彻底退出，从托盘菜单选“退出程序”，或先唤回窗口、取消勾选
+“关闭后静默运行”再点关闭按钮。
+
+v1.2.2 起窗口的 Wayland app_id / X11 WM_CLASS 固定为 `drcom-campus`，与
+`drcom-campus.desktop` 一致，GNOME 能正确识别窗口、托盘与 dock 条目，不会再出现
+“关不掉、打不开”的幽灵窗口。启动时程序会先询问会话总线是否存在
+`org.kde.StatusNotifierWatcher`；没有时直接按无托盘方式运行，不再向终端打印告警。
 
 ## 打包发布
 
@@ -367,5 +371,7 @@ cd /tmp/drcom-campus-linux-x86_64-v1.0.4 && ./install.sh
 
 ## 许可
 
-本项目以 [CC BY-NC 4.0](../LICENSE)（署名—非商业性使用）授权。使用、修改、分享时请保留
-作者署名（ZincGluxx），且不得用于商业目的；仅限在你本人有合法账号的校园网内使用。
+本项目以 [GNU AGPL v3.0](../LICENSE)（GNU Affero 通用公共许可证第 3 版）授权。
+使用、修改、分享时请保留作者署名（ZincGluxx）与 [NOTICE](../NOTICE) 中的上游归属说明；
+仅限在你本人有合法账号的校园网内使用。旧版本（CC BY-NC 4.0 时期发布的版本）仍适用其
+当时的许可条款。
