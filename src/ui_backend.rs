@@ -798,6 +798,12 @@ impl Backend {
             #[cfg(not(target_os = "linux"))]
             let _ = backgrounded;
             let _ = window.show();
+            // A window that was never mapped (silent start) or whose Wayland
+            // surface was destroyed while hidden does not get an initial redraw
+            // from the compositor. Without this the window would exist but never
+            // be painted — the state where a tray entry or dock icon "does
+            // nothing" when clicked.
+            window.window().request_redraw();
         });
     }
 
