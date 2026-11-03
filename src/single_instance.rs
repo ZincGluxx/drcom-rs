@@ -19,6 +19,18 @@ use std::ptr;
 /// client's name so both builds can be installed side by side.
 pub const APP_NAME: &str = "Local\\DrComCampus-Rust-SingleInstance";
 
+/// The name this process claims. `DRCOM_INSTANCE_SUFFIX` namespaces it, which is
+/// what lets the footprint tooling run a build next to the installed client
+/// instead of having its launch handed over to the copy already in the tray. It
+/// is a test hook, not a supported way to run two clients at once: both would
+/// fight over the same UDP session.
+pub fn app_name() -> String {
+    match std::env::var("DRCOM_INSTANCE_SUFFIX") {
+        Ok(suffix) if !suffix.is_empty() => format!("{APP_NAME}-{suffix}"),
+        _ => APP_NAME.to_string(),
+    }
+}
+
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const INFINITE: u32 = 0xFFFF_FFFF;
 

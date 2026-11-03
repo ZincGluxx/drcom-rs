@@ -176,7 +176,16 @@ pub mod autostart {
     fn name() -> Vec<u16> {
         wide("DrComCampusRust")
     }
+    /// The autostart entry starts in the notification area: signing in at boot
+    /// should not throw a window in the user's face, and a window is the most
+    /// expensive thing this process can hold.
     fn command() -> io::Result<String> {
+        Ok(format!("\"{}\" --tray", std::env::current_exe()?.display()))
+    }
+    /// Entries written by older versions have no --tray flag, and they still count
+    /// as "autostart is on" — otherwise the checkbox would silently flip off for
+    /// everyone who had it enabled before the flag existed.
+    fn legacy_command() -> io::Result<String> {
         Ok(format!("\"{}\"", std::env::current_exe()?.display()))
     }
     pub fn enabled() -> io::Result<bool> {
@@ -200,7 +209,9 @@ pub mod autostart {
             return Err(io::Error::from_raw_os_error(code as i32));
         }
         let end = buffer.iter().position(|v| *v == 0).unwrap_or(buffer.len());
-        Ok(String::from_utf16_lossy(&buffer[..end]).eq_ignore_ascii_case(&command()?))
+        let stored = String::from_utf16_lossy(&buffer[..end]);
+        Ok(stored.eq_ignore_ascii_case(&command()?)
+            || stored.eq_ignore_ascii_case(&legacy_command()?))
     }
     pub fn set(enabled: bool) -> io::Result<()> {
         let code = if enabled {

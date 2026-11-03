@@ -1,6 +1,6 @@
 [package]
 name = "drcom-campus"
-version = "1.0.4"
+version = "1.2.1"
 edition = "2024"
 build = "build.rs"
 

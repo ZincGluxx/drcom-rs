@@ -88,6 +88,33 @@ struct Shared {
     probing: bool,
     edit_adapter: Option<adapter::AdapterInfo>,
     network_busy: bool,
+    /// Everything below mirrors what the window is showing. The window can be
+    /// closed to the tray at any moment, so the backend — not the component — has
+    /// to be the source of truth for a window that is built later.
+    config_status: Option<String>,
+    autostart: Option<bool>,
+    remembered: Option<Preferences>,
+    connection_state: String,
+    status_detail: String,
+    campus_page_status: String,
+    last_failure: LastFailure,
+    startup_complaint: Option<String>,
+    /// Set when the window is sent back to the tray. The event loop owns the
+    /// component and therefore owns the release itself; a background thread (the
+    /// session, the auto-hide after a login) can only record that it is due.
+    release_requested: bool,
+}
+
+/// The failure card on the login page, kept in the backend so reopening the
+/// window still shows why the last attempt failed.
+#[derive(Debug, Clone, Default)]
+struct LastFailure {
+    text: String,
+    time: String,
+    stage: String,
+    code: String,
+    duration: String,
+    retry: String,
 }
 
 impl Default for Shared {
@@ -105,6 +132,15 @@ impl Default for Shared {
             probing: false,
             edit_adapter: None,
             network_busy: false,
+            config_status: None,
+            autostart: None,
+            remembered: None,
+            connection_state: "未连接".to_string(),
+            status_detail: String::new(),
+            campus_page_status: String::new(),
+            last_failure: LastFailure::default(),
+            startup_complaint: None,
+            release_requested: false,
         }
     }
 }
@@ -155,7 +191,13 @@ fn page_probe_status(page: CampusPage, failed: bool, outcome: PageProbeOutcome) 
 }
 
 pub struct Backend {
-    window: slint::Weak<AppWindow>,
+    /// The window is created on demand and dropped again when the user closes it
+    /// to the tray, so anything that outlives a single window — the session
+    /// thread, the page probe, the tray callbacks — has to look the window up
+    /// here instead of capturing one. Slint keeps the render target for as long
+    /// as the component exists, and that target is the largest single block this
+    /// process commits.
+    ui: Arc<Mutex<slint::Weak<AppWindow>>>,
     /// The tray icon is a separate Slint component, so the only way to keep its
     /// tooltip in step with the session is to hold a handle to it here.
     tray: slint::Weak<AppTray>,
@@ -167,19 +209,67 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Wires the window callbacks, fills the adapter panel, and seeds the login
-    /// form from the configuration file.
-    pub fn attach(window: &AppWindow, tray: &AppTray) -> Self {
+    /// The window currently on screen, if any. Running with no window at all is a
+    /// normal state here: the process lives in the tray and only builds a window
+    /// when the user asks for one.
+    fn ui(&self) -> Option<AppWindow> {
+        self.ui_weak().upgrade()
+    }
+
+    fn ui_weak(&self) -> slint::Weak<AppWindow> {
+        match self.ui.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Publishes a freshly built window to everything that pushes updates into it,
+    /// replays the state it is supposed to show, and wires its callbacks. Called on
+    /// every open, not just the first one: each open builds a new component, so
+    /// the callbacks the previous one carried went away with it.
+    pub fn bind(&self, window: &AppWindow) {
+        match self.ui.lock() {
+            Ok(mut slot) => *slot = window.as_weak(),
+            Err(poisoned) => *poisoned.into_inner() = window.as_weak(),
+        }
+        self.seed_window(window);
+        self.attach_callbacks(window);
+    }
+
+    /// Takes the pending "send the window to the tray" request, if any. Whoever
+    /// takes it is responsible for hiding and releasing the component.
+    pub fn take_release_request(&self) -> bool {
+        match self.shared.lock() {
+            Ok(mut shared) => std::mem::take(&mut shared.release_requested),
+            Err(poisoned) => std::mem::take(&mut poisoned.into_inner().release_requested),
+        }
+    }
+
+    /// Forgets a request that a rebuilt window has already satisfied.
+    pub fn clear_release_request(&self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.release_requested = false;
+        }
+    }
+
+    /// Drops the handle so a window that is going away stops receiving writes.
+    pub fn unbind(&self) {
+        match self.ui.lock() {
+            Ok(mut slot) => *slot = slint::Weak::default(),
+            Err(poisoned) => *poisoned.into_inner() = slint::Weak::default(),
+        }
+    }
+
+    /// Reads the configuration and the saved preferences and builds the half of
+    /// the backend that outlives every window. Anything that has to survive the
+    /// window being closed belongs here rather than in `seed_window`.
+    pub fn new(tray: &AppTray) -> Self {
         let (settings, complaint) = match load_settings() {
             Ok(settings) => (settings, None),
             Err(message) => (ClientConfig::default(), Some(message)),
         };
-        if !settings.account.is_empty() {
-            window.set_username(settings.account.clone().into());
-            window.set_password(settings.password.clone().into());
-        }
         let backend = Self {
-            window: window.as_weak(),
+            ui: Arc::new(Mutex::new(slint::Weak::default())),
             tray: tray.as_weak(),
             shared: Arc::new(Mutex::new(Shared::default())),
             settings: Arc::new(settings),
@@ -192,39 +282,106 @@ impl Backend {
                 None => "无（使用内置认证服务器）".to_string(),
             }
         ));
-        match preferences::path().and_then(|path| preferences::load(&path)) {
-            Ok(prefs) => {
-                if !prefs.username.is_empty() {
-                    window.set_config_status("已记住你的账号".into());
-                    window.set_username(prefs.username.clone().into());
+        {
+            let mut shared = backend.shared.lock().unwrap();
+            if let Some(complaint) = complaint {
+                shared.startup_complaint = Some(complaint);
+            }
+            match preferences::path().and_then(|path| preferences::load(&path)) {
+                Ok(prefs) => {
+                    shared.minimize_to_tray = prefs.minimize_to_tray;
+                    shared.config_status = if prefs.username.is_empty() {
+                        None
+                    } else {
+                        Some("已记住你的账号".to_string())
+                    };
+                    let auto_ready = !prefs.username.is_empty() && !prefs.password.is_empty();
+                    if shared.startup_complaint.is_none() && prefs.auto_login && auto_ready {
+                        shared.pending_auto =
+                            Some((prefs.clone(), Instant::now() + Duration::from_secs(90)));
+                    }
+                    shared.remembered = Some(prefs);
                 }
-                if let Some(password) = saved_password_for_form(&prefs) {
-                    window.set_password(password.into());
-                }
-                window.set_auto_login(prefs.auto_login);
-                window.set_auto_reconnect(prefs.auto_reconnect);
-                window.set_minimize_to_tray(prefs.minimize_to_tray);
-                backend.shared.lock().unwrap().minimize_to_tray = prefs.minimize_to_tray;
-                if complaint.is_none()
-                    && prefs.auto_login
-                    && !prefs.username.is_empty()
-                    && !prefs.password.is_empty()
-                {
-                    backend.shared.lock().unwrap().pending_auto =
-                        Some((prefs, Instant::now() + Duration::from_secs(90)));
+                Err(_) => {
+                    shared.config_status = Some("读取失败，请重新保存账号".to_string());
                 }
             }
-            Err(_) => window.set_config_status("读取失败，请重新保存账号".into()),
+            shared.autostart = match preferences::autostart::enabled() {
+                Ok(enabled) => Some(enabled),
+                Err(_) => {
+                    shared.config_status = Some("无法读取开机启动状态".to_string());
+                    None
+                }
+            };
         }
-        match preferences::autostart::enabled() {
-            Ok(enabled) => window.set_start_with_windows(enabled),
-            Err(_) => window.set_config_status("无法读取开机启动状态".into()),
-        }
-        backend.refresh_adapter(None);
-        if let Some(complaint) = complaint {
+        if let Some(complaint) = backend.shared.lock().unwrap().startup_complaint.clone() {
             backend.remember_failure_text(&complaint);
             backend.set_connection("未连接", &complaint);
         }
+        // One probe per launch, with or without a window: the answer is kept in
+        // `shared` and replayed into whichever window is opened next.
+        backend.start_page_probe();
+        backend
+    }
+
+    /// Replays what the window should show right now. Run on every open, so a
+    /// window that was closed to the tray and reopened is not a blank slate.
+    fn seed_window(&self, window: &AppWindow) {
+        if !self.settings.account.is_empty() {
+            window.set_username(self.settings.account.clone().into());
+            window.set_password(self.settings.password.clone().into());
+        }
+        let (config_status, autostart, remembered, connection, detail, page, failure, minimize) = {
+            let shared = self.shared.lock().unwrap();
+            (
+                shared.config_status.clone(),
+                shared.autostart,
+                shared.remembered.clone(),
+                shared.connection_state.clone(),
+                shared.status_detail.clone(),
+                shared.campus_page_status.clone(),
+                shared.last_failure.clone(),
+                shared.minimize_to_tray,
+            )
+        };
+        if let Some(prefs) = remembered {
+            if !prefs.username.is_empty() {
+                window.set_username(prefs.username.clone().into());
+            }
+            if let Some(password) = saved_password_for_form(&prefs) {
+                window.set_password(password.into());
+            }
+            window.set_auto_login(prefs.auto_login);
+            window.set_auto_reconnect(prefs.auto_reconnect);
+        }
+        window.set_minimize_to_tray(minimize);
+        if let Some(enabled) = autostart {
+            window.set_start_with_windows(enabled);
+        }
+        if let Some(status) = config_status {
+            window.set_config_status(status.into());
+        }
+        window.set_connection_state(connection.clone().into());
+        window.set_online(connection == "已连接");
+        window.set_session_active(connection != "未连接");
+        window.set_status_detail(detail.into());
+        window.set_campus_page_status(page.into());
+        window.set_last_failure(failure.text.into());
+        window.set_last_failure_time(failure.time.into());
+        window.set_last_failure_stage(failure.stage.into());
+        window.set_last_failure_code(failure.code.into());
+        window.set_last_failure_duration(failure.duration.into());
+        window.set_last_failure_retry(failure.retry.into());
+        if let Some(start) = self.shared.lock().unwrap().connected_since {
+            window.set_duration(format_duration(start.elapsed()).into());
+        }
+        self.refresh_adapter(None);
+    }
+
+    /// Wires the window callbacks, fills the adapter panel, and seeds the login
+    /// form from the configuration file.
+    fn attach_callbacks(&self, window: &AppWindow) {
+        let backend = self.clone_handle();
 
         let connect = backend.clone_handle();
         window.on_connect_requested(move |username, password, auto_reconnect| {
@@ -252,7 +409,7 @@ impl Backend {
         });
         let copy = backend.clone_handle();
         window.on_copy_requested(move || {
-            if let Some(window) = copy.window.upgrade() {
+            if let Some(window) = copy.ui() {
                 match crate::diagnostics::copy(&diagnostics_report(&window, &copy.settings)) {
                     Ok(()) => copy.set_status("诊断已复制（不包含账号密码）"),
                     Err(error) => copy.set_status(&format!("复制失败：{error}")),
@@ -287,7 +444,7 @@ impl Backend {
                         shared.hide_at = None;
                     }
                 }
-                if let Some(window) = save.window.upgrade() {
+                if let Some(window) = save.ui() {
                     window.set_config_status(
                         if result.is_ok() {
                             "账号已安全保存"
@@ -311,8 +468,6 @@ impl Backend {
         window.on_export_requested(move || export.export_diagnostics());
         let clear_password = backend.clone_handle();
         window.on_clear_password_requested(move || clear_password.clear_saved_password());
-        backend.start_page_probe();
-        backend
     }
 
     pub fn tick(&self) {
@@ -321,7 +476,7 @@ impl Backend {
             return;
         }
         if let Some(start) = shared.connected_since
-            && let Some(window) = self.window.upgrade()
+            && let Some(window) = self.ui()
             && window.window().is_visible()
         {
             window.set_duration(format_duration(start.elapsed()).into());
@@ -360,7 +515,7 @@ impl Backend {
         if let Ok(mut shared) = self.shared.lock() {
             shared.page_probe_pending = true;
         }
-        if let Some(window) = self.window.upgrade() {
+        if let Some(window) = self.ui() {
             window.set_campus_page_status("正在只读查询认证服务器首页…".into());
         }
         let backend = self.clone_handle();
@@ -393,10 +548,13 @@ impl Backend {
     }
 
     fn set_campus_page_status(&self, status: &str) {
-        let window = self.window.clone();
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.campus_page_status = status.to_string();
+        }
+        let backend = self.clone_handle();
         let status = status.to_string();
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
+            if let Some(window) = backend.ui() {
                 window.set_campus_page_status(status.into());
             }
         });
@@ -410,7 +568,7 @@ impl Backend {
             }
             shared.probing = true;
         }
-        if let Some(window) = self.window.upgrade() {
+        if let Some(window) = self.ui() {
             window.set_probe_busy(true);
         }
         let backend = self.clone_handle();
@@ -457,7 +615,7 @@ impl Backend {
                 }
             }
             backend.shared.lock().unwrap().probing = false;
-            let window = backend.window.clone();
+            let window = backend.ui_weak();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(window) = window.upgrade() {
                     if let Some(result) = campus {
@@ -507,7 +665,7 @@ impl Backend {
             return;
         };
         shared.pending_auto = None;
-        if let Some(window) = self.window.upgrade() {
+        if let Some(window) = self.ui() {
             window.set_edit_adapter_name(found.friendly_name.clone().into());
             window.set_edit_ip(found.ipv4.to_string().into());
             window.set_edit_mask(
@@ -549,7 +707,7 @@ impl Backend {
         let config = match crate::static_ipv4::Configuration::parse(ip, mask, gateway, dns) {
             Ok(config) => config,
             Err(error) => {
-                if let Some(window) = self.window.upgrade() {
+                if let Some(window) = self.ui() {
                     window.set_network_message(error.into());
                 }
                 return;
@@ -568,14 +726,14 @@ impl Backend {
                 && item.mac == found.mac
                 && item.friendly_name == found.friendly_name
         }) {
-            if let Some(window) = self.window.upgrade() {
+            if let Some(window) = self.ui() {
                 window.set_network_message("网卡已变化，请返回后重新打开网络设置".into());
             }
             return;
         }
         shared.network_busy = true;
         drop(shared);
-        if let Some(window) = self.window.upgrade() {
+        if let Some(window) = self.ui() {
             window.set_network_busy(true);
             window.set_network_message("等待管理员授权与应用结果…".into());
         }
@@ -588,7 +746,7 @@ impl Backend {
                 shared.quitting
             };
             backend.refresh_adapter(None);
-            let window = backend.window.clone();
+            let window = backend.ui_weak();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(window) = window.upgrade() {
                     window.set_network_busy(false);
@@ -606,7 +764,7 @@ impl Backend {
 
     fn clone_handle(&self) -> Self {
         Self {
-            window: self.window.clone(),
+            ui: Arc::clone(&self.ui),
             tray: self.tray.clone(),
             shared: Arc::clone(&self.shared),
             settings: Arc::clone(&self.settings),
@@ -614,28 +772,22 @@ impl Backend {
     }
 
     fn remember_failure(&self, detail: &str) {
-        let window = self.window.clone();
-        let detail = detail.to_string();
-        let occurred_at = event_log::timestamp();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
-                window.set_last_failure(detail.into());
-                window.set_last_failure_time(occurred_at.into());
-            }
-        });
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.last_failure.text = detail.to_string();
+            shared.last_failure.time = event_log::timestamp();
+        }
+        self.push_failure_card();
     }
 
     fn remember_failure_text(&self, detail: &str) {
         self.remember_failure(detail);
-        let window = self.window.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
-                window.set_last_failure_stage("连接准备".into());
-                window.set_last_failure_code("LOCAL-NETWORK".into());
-                window.set_last_failure_duration("未开始".into());
-                window.set_last_failure_retry("不会自动重试".into());
-            }
-        });
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.last_failure.stage = "连接准备".to_string();
+            shared.last_failure.code = "LOCAL-NETWORK".to_string();
+            shared.last_failure.duration = "未开始".to_string();
+            shared.last_failure.retry = "不会自动重试".to_string();
+        }
+        self.push_failure_card();
     }
 
     fn remember_session_failure(
@@ -646,38 +798,61 @@ impl Backend {
     ) {
         let reason = describe_failure(error);
         let (stage, code) = failure_stage_and_code(error);
-        let duration = format!("{}.{:03} 秒", elapsed.as_secs(), elapsed.subsec_millis());
         self.remember_failure(&reason);
-        let window = self.window.clone();
-        let stage = stage.to_string();
-        let code = code.to_string();
-        let retry_summary = retry_summary.to_string();
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.last_failure.stage = stage.to_string();
+            shared.last_failure.code = code.to_string();
+            shared.last_failure.duration =
+                format!("{}.{:03} 秒", elapsed.as_secs(), elapsed.subsec_millis());
+            shared.last_failure.retry = retry_summary.to_string();
+        }
+        self.push_failure_card();
+    }
+
+    /// Pushes the stored failure card into whichever window exists right now. The
+    /// card lives in the backend because the window it was first written to may
+    /// already have been closed to the tray.
+    fn push_failure_card(&self) {
+        let card = match self.shared.lock() {
+            Ok(shared) => shared.last_failure.clone(),
+            Err(poisoned) => poisoned.into_inner().last_failure.clone(),
+        };
+        let backend = self.clone_handle();
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
-                window.set_last_failure_stage(stage.into());
-                window.set_last_failure_code(code.into());
-                window.set_last_failure_duration(duration.into());
-                window.set_last_failure_retry(retry_summary.into());
+            if let Some(window) = backend.ui() {
+                window.set_last_failure(card.text.clone().into());
+                window.set_last_failure_time(card.time.clone().into());
+                window.set_last_failure_stage(card.stage.clone().into());
+                window.set_last_failure_code(card.code.clone().into());
+                window.set_last_failure_duration(card.duration.clone().into());
+                window.set_last_failure_retry(card.retry.clone().into());
             }
         });
     }
 
     fn set_status(&self, text: &str) {
-        let window = self.window.clone();
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.status_detail = text.to_string();
+        }
+        let backend = self.clone_handle();
         let text = text.to_string();
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
+            if let Some(window) = backend.ui() {
                 window.set_status_detail(text.into());
             }
         });
     }
 
     fn set_connection(&self, state: &str, detail: &str) {
-        let window = self.window.clone();
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.connection_state = state.to_string();
+            shared.status_detail = detail.to_string();
+        }
+        let backend = self.clone_handle();
         let state = state.to_string();
         let detail = detail.to_string();
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
+            if let Some(window) = backend.ui() {
                 window.set_online(state == "已连接");
                 window.set_session_active(state != "未连接");
                 window.set_connection_state(state.into());
@@ -690,9 +865,15 @@ impl Backend {
     /// part of the program still visible once the window is hidden.
     fn hide_to_tray(&self, note: &str) {
         self.set_tooltip_text(note);
-        let window = self.window.clone();
+        // Hiding alone leaves a window whose renderer still believes its buffer
+        // holds a full frame; showing it again paints only what changed since.
+        // The event loop releases the component instead, so note it here.
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.release_requested = true;
+        }
+        let backend = self.clone_handle();
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
+            if let Some(window) = backend.ui() {
                 let _ = window.hide();
             }
         });
@@ -707,8 +888,7 @@ impl Backend {
     /// running session without a restart.
     pub fn close_to_tray(&self) -> bool {
         let minimize = self
-            .window
-            .upgrade()
+            .ui()
             .map(|window| window.get_minimize_to_tray())
             .unwrap_or(true);
         if let Ok(mut shared) = self.shared.lock() {
@@ -762,7 +942,7 @@ impl Backend {
     /// reveals it in Explorer. Copying to the clipboard covers pasting into a chat;
     /// a file is what gets attached to a report.
     fn export_diagnostics(&self) {
-        let Some(window) = self.window.upgrade() else {
+        let Some(window) = self.ui() else {
             return;
         };
         match crate::diagnostics::export(&diagnostics_report(&window, &self.settings)) {
@@ -776,7 +956,7 @@ impl Backend {
 
     fn refresh_adapter(&self, note: Option<&str>) {
         let selected = adapter::select_for(self.settings.servers_or_env().first().copied());
-        let window = self.window.clone();
+        let window = self.ui_weak();
         let note = note.map(str::to_string);
         let _ = slint::invoke_from_event_loop(move || {
             let Some(window) = window.upgrade() else {
@@ -837,7 +1017,7 @@ impl Backend {
     }
 
     fn clear_saved_password(&self) {
-        let Some(window) = self.window.upgrade() else {
+        let Some(window) = self.ui() else {
             return;
         };
         let prefs = cleared_password_preferences(
@@ -885,7 +1065,7 @@ impl Backend {
     }
 
     fn show_session_adapter(&self, found: &adapter::AdapterInfo) {
-        let window = self.window.clone();
+        let window = self.ui_weak();
         let found = found.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = window.upgrade() {
@@ -1128,7 +1308,7 @@ impl Backend {
     }
 
     fn set_online_duration(&self, text: &str) {
-        let window = self.window.clone();
+        let window = self.ui_weak();
         let text = text.to_string();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = window.upgrade() {

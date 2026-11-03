@@ -1,0 +1,66 @@
+{
+  "measured_at": "2026-11-02T07:20:00+08:00",
+  "platform": "Windows x64",
+  "method": "Process.PrivateMemorySize64 / WorkingSet64, 6 samples 500 ms apart, plus VirtualQueryEx attribution",
+  "rows": [
+    {
+      "form": "shipping-gui-authenticated-tray",
+      "working_set_kib": 19932,
+      "private_commit_kib": 5728,
+      "threads": 4,
+      "pid": 17308
+    },
+    {
+      "form": "shipping-gui-window-shown",
+      "working_set_kib": 22742,
+      "private_commit_kib": 5755,
+      "threads": 5,
+      "pid": 17308
+    },
+    {
+      "form": "probe-empty-window",
+      "working_set_kib": 21066,
+      "private_commit_kib": 5448,
+      "threads": 8
+    },
+    {
+      "form": "probe-empty-window-plus-tray-hidden",
+      "working_set_kib": 21708,
+      "private_commit_kib": 5508,
+      "threads": 8
+    },
+    {
+      "form": "probe-tray-only",
+      "working_set_kib": 10728,
+      "private_commit_kib": 1916,
+      "threads": 4
+    },
+    {
+      "form": "drcom-cli-headless-login-attempt",
+      "working_set_kib": 4936,
+      "private_commit_kib": 904,
+      "threads": 5
+    },
+    {
+      "form": "minimal-rust-sleep",
+      "working_set_kib": 3396,
+      "private_commit_kib": 628,
+      "threads": 4
+    },
+    {
+      "form": "minimal-rust-socket-thread-log",
+      "working_set_kib": 4028,
+      "private_commit_kib": 756,
+      "threads": 5
+    }
+  ],
+  "private_commit_attribution_shipping_gui_kib": {
+    "framework-block-1": 1604,
+    "framework-block-2": 1020,
+    "heap": 500,
+    "main-thread-stack": 208,
+    "worker-thread-stacks": 164,
+    "other": 284
+  },
+  "pagefile_backed_sections_kib": 2113
+}
