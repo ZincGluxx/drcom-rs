@@ -68,12 +68,16 @@ export component AppTray inherits SystemTrayIcon {
 export component AppWindow inherits Window {
     title: "DrCom 校园网助手";
     icon: @image-url("../assets/icon-128.png");
+    // The custom title bar below is part of the client area (no-frame), so the
+    // window is 34 px taller than the 480x380 content it used to have under the
+    // native decoration. Without that the content area loses the title bar's
+    // height and the cards are squeezed.
     preferred-width: 480px;
-    preferred-height: 380px;
+    preferred-height: 414px;
     min-width: 480px;
-    min-height: 380px;
+    min-height: 414px;
     max-width: 480px;
-    max-height: 380px;
+    max-height: 414px;
     // The window is drawn by the application: the native title bar is replaced
     // by the custom one below so the Client-Side Decoration matches the theme
     // and the close button can follow the "close means keep running" option.
@@ -161,7 +165,12 @@ export component AppWindow inherits Window {
                 padding-left: 10px;
                 padding-right: 6px;
                 spacing: 6px;
-                alignment: center;
+                // `alignment` would centre the whole row horizontally (logo, title
+                // and buttons bunched in the middle). The row has to fill the bar
+                // and centre its children vertically instead.
+                width: parent.width;
+                height: parent.height;
+                cross-axis-alignment: center;
                 Rectangle {
                     width: 18px;
                     height: 18px;
@@ -198,7 +207,12 @@ export component AppWindow inherits Window {
         ScrollView {
             vertical-stretch: 1;
             visible: !root.network-editor-visible;
+            // The window is fixed-width, so a horizontal scrollbar can only ever
+            // appear because the content is 14 px wider than the viewport (the
+            // vertical bar's width). Pin the content to the viewport instead.
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
         VerticalLayout {
+            width: parent.width;
             padding: 10px;
             spacing: 4px;
             Surface {
@@ -341,7 +355,9 @@ export component AppWindow inherits Window {
     }
         if root.network-editor-visible : ScrollView {
             vertical-stretch: 1;
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
         VerticalLayout {
+            width: parent.width;
             padding: 16px;
             spacing: 6px;
             Text { text: "校园网地址设置"; font-size: 16px; font-weight: 600; color: Theme.heading-text; }

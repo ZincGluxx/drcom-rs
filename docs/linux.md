@@ -86,16 +86,16 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### 手动下载发布包
 
-发布包文件名形如 `drcom-campus-linux-x86_64-v1.2.4.tar.gz`。从
+发布包文件名形如 `drcom-campus-linux-x86_64-v1.2.5.tar.gz`。从
 <https://github.com/ZincGluxx/drcom-rs/releases/latest> 下载后（国内可用
 `https://ghproxy.net/https://github.com/ZincGluxx/drcom-rs/releases/latest`）：
 
 ```bash
 # 校验（可选，在压缩包所在目录执行）
-sha256sum -c drcom-campus-linux-x86_64-v1.2.4.tar.gz.sha256
+sha256sum -c drcom-campus-linux-x86_64-v1.2.5.tar.gz.sha256
 
-tar xzf drcom-campus-linux-x86_64-v1.2.4.tar.gz
-cd drcom-campus-linux-x86_64-v1.2.4
+tar xzf drcom-campus-linux-x86_64-v1.2.5.tar.gz
+cd drcom-campus-linux-x86_64-v1.2.5
 ./install.sh              # 只安装程序
 ./install.sh --autostart  # 同时启用静默开机自启
 ```
@@ -301,7 +301,7 @@ sudo pacman -S --needed gnome-shell-extension-appindicator
 继续保活。想彻底退出，从托盘菜单选“退出程序”，或先唤回窗口、取消勾选
 “关闭后静默运行”再点关闭按钮。
 
-v1.2.4 起窗口的 Wayland app_id / X11 WM_CLASS 固定为 `drcom-campus`，与
+v1.2.5 起窗口的 Wayland app_id / X11 WM_CLASS 固定为 `drcom-campus`，与
 `drcom-campus.desktop` 一致，GNOME 能正确识别窗口、托盘与 dock 条目，不会再出现
 “关不掉、打不开”的幽灵窗口。启动时程序会先询问会话总线是否存在
 `org.kde.StatusNotifierWatcher`；没有时直接按无托盘方式运行，不再向终端打印告警。
