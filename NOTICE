@@ -1,0 +1,13 @@
+DrCom 校园网助手（Rust 版） / drcom-campus
+Copyright (C) 2026 ZincGlux
+
+本程序以 GNU Affero 通用公共许可证第 3 版（GNU AGPL-3.0，
+或你选择的任何更新版本）授权，完整法律文本见 LICENSE。
+
+本程序的 Dr.COM 认证协议实现参考并复刻自上游开源项目：
+
+    drcoms/jlu-drcom-client
+    https://github.com/drcoms/jlu-drcom-client   (AGPL-3.0)
+
+上游作者与贡献者的著作权归其各自所有；本声明不改变、也不替代上游许可
+证的任何条款。详细的参考范围与依赖声明见 THIRD-PARTY-NOTICES.md。
