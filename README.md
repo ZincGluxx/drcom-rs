@@ -6,7 +6,7 @@
 [![Windows](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?style=flat-square&logo=windows&logoColor=white)]()
 [![Tests](https://img.shields.io/badge/tests-100%20passing-3FB950?style=flat-square)]()
 [![Installer](https://img.shields.io/badge/installer-6.5%20MB-blue?style=flat-square)]()
-[![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 
 吉林大学（JLU）校园网 Dr.COM 认证客户端的 **Rust + Slint** 重写版。完整实现
 challenge → login → keep-alive → logout 协议流程，已对真实认证服务器长期实测通过；
@@ -120,7 +120,8 @@ drcom-cli --user 20230001 --pass secret
 
 ## 🔬 协议实现与测试
 
-- 认证逻辑以社区 B 世代 Python 实现（`newclient.py` / `jlu-drcom-py3`）为基准，
+- 认证逻辑以社区 B 世代 Python 实现（上游 [drcoms/jlu-drcom-client](https://github.com/drcoms/jlu-drcom-client)
+  的 `newclient.py` / `jlu-drcom-py3`）为基准，
   `src/reference_login.rs` 与之逐字节对应，是本部署实际认证成功的那一套。
 - 登录帧长度随密码长度变化（368 / 370 / 373 / 374 字节），实现按 `password.len()`
   动态构造，参考向量固化在 `reference/` 下并由测试钉住。
@@ -145,15 +146,23 @@ drcom-rs/
 
 - [drcom-net-client](https://github.com/ZincGluxx/drcom-net-client) — 主仓库：
   C# + Avalonia 实现与全部开发文档、诊断报告。
-- [jlu-drcom-client](https://github.com/ZincGluxx/jlu-drcom-client) — 四个协议
-  世代共八套社区实现的汇总参考。
+- [drcoms/jlu-drcom-client](https://github.com/drcoms/jlu-drcom-client) — 本仓库认证
+  实现的上游参考：四个协议世代共八套社区实现（AGPL-3.0；本地 fork 见
+  [ZincGluxx/jlu-drcom-client](https://github.com/ZincGluxx/jlu-drcom-client)）。
 
 ## 📄 许可
 
-本项目（含本仓库与主仓库的 C# 实现）以
-[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)（署名—非商业性使用）授权，
-完整文本见 [LICENSE](LICENSE)。使用、修改、分享时请保留作者署名（ZincGlux），
-且不得用于商业目的。
+本仓库与主仓库 [drcom-net-client](https://github.com/ZincGluxx/drcom-net-client) 一并以
+[GNU Affero 通用公共许可证第 3 版（AGPL-3.0）](https://www.gnu.org/licenses/agpl-3.0.html)
+授权，完整法律文本见 [LICENSE](LICENSE)，版权与许可提示见 [NOTICE](NOTICE)，
+上游归属说明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+- 可以自由地使用、修改、分发本项目，包括商业用途；
+- 分发修改版时，须以 AGPL-3.0 提供完整源码，并保留原有版权与归属声明；
+- 若将本程序（或其修改版）作为网络服务提供给他人使用，也必须向这些用户提供对应源码（AGPL 第 13 条）。
+
+> **许可变更说明**：v1.2.1 及更早版本以 CC BY-NC 4.0 发布；自本次变更起，本仓库代码统一改为 AGPL-3.0。
+> 已按 CC BY-NC 4.0 获得的旧版本，仍适用其当时的许可条款。
 
 ## ⚠️ 声明
 

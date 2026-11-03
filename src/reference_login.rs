@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// 上游参考：https://github.com/drcoms/jlu-drcom-client （AGPL-3.0）
+
 //! Byte-exact port of the login frame, primary keep-alive digest and challenge
 //! nonce used by the third-party Python Dr.COM client. The local C# client
 //! follows most of this layout but differs in its fixed client key and checksum
