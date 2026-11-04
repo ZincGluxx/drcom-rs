@@ -70,6 +70,69 @@ impl ReconnectBackoff {
     }
 }
 
+/// The window is built on demand: a tray-only start must not create a window at
+/// all, because the shell registers the Wayland toplevel as soon as it exists and
+/// shows a taskbar entry that can never be activated (the "ghost window").
+///
+/// The backend therefore holds only a weak slot. Until the first `show`, every UI
+/// update is a no-op; the last known state is kept in [`UiSnapshot`] and replayed
+/// when the window is finally built.
+#[derive(Clone, Default)]
+struct WindowSlot(Arc<Mutex<Option<slint::Weak<AppWindow>>>>);
+
+impl WindowSlot {
+    fn set(&self, window: &AppWindow) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(window.as_weak());
+        }
+    }
+
+    fn upgrade(&self) -> Option<AppWindow> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .and_then(|weak| weak.upgrade())
+    }
+}
+
+/// Last state pushed to the window, replayed when a window is created after a
+/// silent start (or recreated after being released).
+#[derive(Clone)]
+struct UiSnapshot {
+    connection_state: String,
+    status_detail: String,
+    online: bool,
+    session_active: bool,
+    duration: String,
+    campus_page_status: String,
+    last_failure: String,
+    failure_stage: String,
+    failure_code: String,
+    failure_time: String,
+    failure_duration: String,
+    failure_retry: String,
+}
+
+impl Default for UiSnapshot {
+    fn default() -> Self {
+        Self {
+            connection_state: "未连接".into(),
+            status_detail: "正在查找可用的网络连接…".into(),
+            online: false,
+            session_active: false,
+            duration: "--".into(),
+            campus_page_status: "网页状态尚未检测".into(),
+            last_failure: "本次运行尚未发生连接问题".into(),
+            failure_stage: "--".into(),
+            failure_code: "--".into(),
+            failure_time: "--".into(),
+            failure_duration: "--".into(),
+            failure_retry: "--".into(),
+        }
+    }
+}
+
 struct Shared {
     stop: Option<Arc<AtomicBool>>,
     reconnect_allowed: Arc<AtomicBool>,
@@ -93,6 +156,7 @@ struct Shared {
     /// `--silent`. Surfacing the window has to recreate it on Wayland, where the
     /// compositor ignores client-side unminimize requests.
     window_backgrounded: bool,
+    ui: UiSnapshot,
 }
 
 impl Default for Shared {
@@ -111,6 +175,7 @@ impl Default for Shared {
             edit_adapter: None,
             network_busy: false,
             window_backgrounded: true,
+            ui: UiSnapshot::default(),
         }
     }
 }
@@ -163,7 +228,7 @@ fn page_probe_status(page: CampusPage, failed: bool, outcome: PageProbeOutcome) 
 }
 
 pub struct Backend {
-    window: slint::Weak<AppWindow>,
+    window: WindowSlot,
     /// The tray icon is a separate Slint component, so the only way to keep its
     /// tooltip in step with the session is to hold a handle to it here. It is
     /// absent when the desktop cannot host a StatusNotifierItem, and the code
@@ -196,19 +261,19 @@ impl Backend {
         }
     }
 
-    /// Wires the window callbacks, fills the adapter panel, and seeds the login
-    /// form from the configuration file.
-    pub fn attach(window: &AppWindow, tray: Option<&AppTray>, start_hidden: bool) -> Self {
+    /// Creates the backend without a window.
+    ///
+    /// The window is built later, on demand (see the entry point): a tray-only
+    /// start must not create a Wayland toplevel at all, because the shell lists
+    /// that toplevel as a running window which can never be activated — the
+    /// "ghost window" in the dock/taskbar.
+    pub fn new(tray: Option<&AppTray>, start_hidden: bool) -> Self {
         let (settings, complaint) = match load_settings() {
             Ok(settings) => (settings, None),
             Err(message) => (ClientConfig::default(), Some(message)),
         };
-        if !settings.account.is_empty() {
-            window.set_username(settings.account.clone().into());
-            window.set_password(settings.password.clone().into());
-        }
         let backend = Self {
-            window: window.as_weak(),
+            window: WindowSlot::default(),
             tray: Mutex::new(tray.map(|tray| tray.as_weak())),
             shared: Arc::new(Mutex::new(Shared {
                 window_backgrounded: start_hidden,
@@ -224,6 +289,41 @@ impl Backend {
                 None => "无（使用内置认证服务器）".to_string(),
             }
         ));
+        // Only the parts the session thread needs are set up here; everything
+        // that touches the window is replayed by `bind_window`.
+        if let Ok(prefs) = preferences::path().and_then(|path| preferences::load(&path)) {
+            backend.shared.lock().unwrap().minimize_to_tray = prefs.minimize_to_tray;
+            if complaint.is_none()
+                && prefs.auto_login
+                && !prefs.username.is_empty()
+                && !prefs.password.is_empty()
+            {
+                // Boot can take a while (DHCP, Wi-Fi association, campus portal),
+                // so give the auto-login a generous window to find an adapter.
+                backend.shared.lock().unwrap().pending_auto =
+                    Some((prefs, Instant::now() + Duration::from_secs(300)));
+            }
+        }
+        if let Some(complaint) = complaint {
+            let mut shared = backend.shared.lock().unwrap();
+            shared.ui.last_failure = complaint.clone();
+            shared.ui.failure_stage = "连接准备".into();
+            shared.ui.failure_code = "LOCAL-NETWORK".into();
+            shared.ui.status_detail = complaint;
+        }
+        backend
+    }
+
+    /// Attaches a freshly built window: seeds the forms, replays the last known
+    /// state and wires every UI callback. Called once per window instance.
+    pub fn bind_window(&self, window: &AppWindow) {
+        let settings = &self.settings;
+        let backend = self.clone_handle();
+        self.window.set(window);
+        if !settings.account.is_empty() {
+            window.set_username(settings.account.clone().into());
+            window.set_password(settings.password.clone().into());
+        }
         match preferences::path().and_then(|path| preferences::load(&path)) {
             Ok(prefs) => {
                 if !prefs.username.is_empty() {
@@ -237,16 +337,6 @@ impl Backend {
                 window.set_auto_reconnect(prefs.auto_reconnect);
                 window.set_minimize_to_tray(prefs.minimize_to_tray);
                 backend.shared.lock().unwrap().minimize_to_tray = prefs.minimize_to_tray;
-                if complaint.is_none()
-                    && prefs.auto_login
-                    && !prefs.username.is_empty()
-                    && !prefs.password.is_empty()
-                {
-                    // Boot can take a while (DHCP, Wi-Fi association, campus portal),
-                    // so give the auto-login a generous window to find an adapter.
-                    backend.shared.lock().unwrap().pending_auto =
-                        Some((prefs, Instant::now() + Duration::from_secs(300)));
-                }
             }
             Err(_) => window.set_config_status("读取失败，请重新保存账号".into()),
         }
@@ -255,10 +345,7 @@ impl Backend {
             Err(_) => window.set_config_status("无法读取开机启动状态".into()),
         }
         backend.refresh_adapter(None);
-        if let Some(complaint) = complaint {
-            backend.remember_failure_text(&complaint);
-            backend.set_connection("未连接", &complaint);
-        }
+        backend.apply_ui_snapshot(window);
 
         let connect = backend.clone_handle();
         window.on_connect_requested(move |username, password, auto_reconnect| {
@@ -365,8 +452,28 @@ impl Backend {
         window.on_export_requested(move || export.export_diagnostics());
         let clear_password = backend.clone_handle();
         window.on_clear_password_requested(move || clear_password.clear_saved_password());
-        backend.start_page_probe();
-        backend
+        self.start_page_probe();
+    }
+
+    /// Replays the last known session state into a newly built window.
+    fn apply_ui_snapshot(&self, window: &AppWindow) {
+        let Ok(shared) = self.shared.lock() else {
+            return;
+        };
+        let ui = shared.ui.clone();
+        drop(shared);
+        window.set_connection_state(ui.connection_state.into());
+        window.set_status_detail(ui.status_detail.into());
+        window.set_online(ui.online);
+        window.set_session_active(ui.session_active);
+        window.set_duration(ui.duration.into());
+        window.set_campus_page_status(ui.campus_page_status.into());
+        window.set_last_failure(ui.last_failure.into());
+        window.set_last_failure_stage(ui.failure_stage.into());
+        window.set_last_failure_code(ui.failure_code.into());
+        window.set_last_failure_time(ui.failure_time.into());
+        window.set_last_failure_duration(ui.failure_duration.into());
+        window.set_last_failure_retry(ui.failure_retry.into());
     }
 
     pub fn tick(&self) {
@@ -374,11 +481,14 @@ impl Backend {
         if shared.quitting {
             return;
         }
-        if let Some(start) = shared.connected_since
-            && let Some(window) = self.window.upgrade()
-            && window.window().is_visible()
-        {
-            window.set_duration(format_duration(start.elapsed()).into());
+        if let Some(start) = shared.connected_since {
+            let text = format_duration(start.elapsed());
+            shared.ui.duration = text.clone();
+            if let Some(window) = self.window.upgrade()
+                && window.window().is_visible()
+            {
+                window.set_duration(text.into());
+            }
         }
         // The hide-after-login delay runs off this one-second timer rather than a
         // second timer of its own.
@@ -444,6 +554,9 @@ impl Backend {
     }
 
     fn set_campus_page_status(&self, status: &str) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.ui.campus_page_status = status.to_string();
+        }
         let window = self.window.clone();
         let status = status.to_string();
         let _ = slint::invoke_from_event_loop(move || {
@@ -665,9 +778,13 @@ impl Backend {
     }
 
     fn remember_failure(&self, detail: &str) {
+        let occurred_at = event_log::timestamp();
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.ui.last_failure = detail.to_string();
+            shared.ui.failure_time = occurred_at.clone();
+        }
         let window = self.window.clone();
         let detail = detail.to_string();
-        let occurred_at = event_log::timestamp();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = window.upgrade() {
                 window.set_last_failure(detail.into());
@@ -678,6 +795,12 @@ impl Backend {
 
     fn remember_failure_text(&self, detail: &str) {
         self.remember_failure(detail);
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.ui.failure_stage = "连接准备".into();
+            shared.ui.failure_code = "LOCAL-NETWORK".into();
+            shared.ui.failure_duration = "未开始".into();
+            shared.ui.failure_retry = "不会自动重试".into();
+        }
         let window = self.window.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(window) = window.upgrade() {
@@ -698,6 +821,12 @@ impl Backend {
         let reason = describe_failure(error);
         let (stage, code) = failure_stage_and_code(error);
         let duration = format!("{}.{:03} 秒", elapsed.as_secs(), elapsed.subsec_millis());
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.ui.failure_stage = stage.to_string();
+            shared.ui.failure_code = code.to_string();
+            shared.ui.failure_duration = duration.clone();
+            shared.ui.failure_retry = retry_summary.to_string();
+        }
         self.remember_failure(&reason);
         let window = self.window.clone();
         let stage = stage.to_string();
@@ -714,6 +843,9 @@ impl Backend {
     }
 
     fn set_status(&self, text: &str) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.ui.status_detail = text.to_string();
+        }
         let window = self.window.clone();
         let text = text.to_string();
         let _ = slint::invoke_from_event_loop(move || {
@@ -724,6 +856,12 @@ impl Backend {
     }
 
     fn set_connection(&self, state: &str, detail: &str) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.ui.connection_state = state.to_string();
+            shared.ui.status_detail = detail.to_string();
+            shared.ui.online = state == "已连接";
+            shared.ui.session_active = state != "未连接";
+        }
         let window = self.window.clone();
         let state = state.to_string();
         let detail = detail.to_string();
@@ -1294,6 +1432,9 @@ impl Backend {
     }
 
     fn set_online_duration(&self, text: &str) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.ui.duration = text.to_string();
+        }
         let window = self.window.clone();
         let text = text.to_string();
         let _ = slint::invoke_from_event_loop(move || {

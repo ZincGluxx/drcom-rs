@@ -9,7 +9,7 @@
 ; 本地 UDP 端口默认自动分配；校园网账号仍可能限制同时在线的设备数。
 
 #define MyAppName "DrCom 校园网助手 (Rust)"
-#define MyAppVersion "1.2.6"
+#define MyAppVersion "1.2.7"
 #define MyAppPublisher "ZincGluxx"
 #define MyAppExeName "drcom-campus.exe"
 #define MyAppCliName "drcom-cli.exe"

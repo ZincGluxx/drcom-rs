@@ -18,6 +18,7 @@ slint::include_modules!();
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use slint::ComponentHandle;
 use slint::winit_030::WinitWindowAccessor;
@@ -83,7 +84,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // it GNOME Shell cannot associate the window with the application entry, so
     // the dock entry can become unopenable and tray interactions look orphaned.
     let _ = slint::set_xdg_app_id("drcom-campus");
-    let app = AppWindow::new()?;
+
     // The window follows the desktop colour scheme by default; `DRCOM_THEME` pins it
     // instead (0 = auto, 1 = light, 2 = dark), for users whose desktop reports the
     // wrong scheme and for capturing screenshots of both palettes. Slint follows the
@@ -94,12 +95,12 @@ fn main() -> Result<(), slint::PlatformError> {
         Ok("dark") => 2,
         _ => desktop_scheme_hint().unwrap_or(0),
     };
-    app.global::<Theme>().set_scheme_override(scheme_override);
     // The tray icon is the only way back to a hidden window, and on Linux it is
     // served over StatusNotifierItem: a desktop without a watcher (stock GNOME, for
     // example) fails to create one. The window must still start, so the tray is
     // optional — `tray-available` makes the UI quit on close instead of hiding
     // into a tray that does not exist.
+    //
     // A login autostart can start before the desktop has published its
     // StatusNotifierWatcher (GNOME loads the AppIndicator extension
     // asynchronously). The first attempt is made here and a background retry
@@ -111,24 +112,63 @@ fn main() -> Result<(), slint::PlatformError> {
     } else {
         None
     };
-    app.set_tray_available(tray.is_some());
-    // Arc rather than Rc: the single-instance worker thread has to call
-    // surface_window(). Every field of Backend is Send + Sync already.
-    let backend = std::sync::Arc::new(ui_backend::Backend::attach(
-        &app,
-        tray.as_ref(),
-        options.silent,
-    ));
+    let tray_available = Rc::new(Cell::new(tray.is_some()));
+
+    // The session backend does not need a window; the window is built on demand
+    // below. Creating it at start-up would make the shell register a Wayland
+    // toplevel that is never mapped and shows up as a ghost entry in the
+    // dock/taskbar.
+    let backend = std::sync::Arc::new(ui_backend::Backend::new(tray.as_ref(), options.silent));
+
+    let window_slot: Rc<RefCell<Option<AppWindow>>> = Rc::new(RefCell::new(None));
+    let open_window: Rc<dyn Fn()> = {
+        let slot = Rc::clone(&window_slot);
+        let backend = backend.clone();
+        let tray_available = Rc::clone(&tray_available);
+        Rc::new(move || {
+            if let Some(window) = slot.borrow().as_ref() {
+                if window.window().is_visible() {
+                    let _ = window.show();
+                } else {
+                    backend.surface_window();
+                }
+                return;
+            }
+            let Ok(window) = AppWindow::new() else {
+                return;
+            };
+            window
+                .global::<Theme>()
+                .set_scheme_override(scheme_override);
+            window.set_tray_available(tray_available.get());
+            backend.bind_window(&window);
+            attach_window_callbacks(&window, &backend);
+            let _ = window.show();
+            backend.note_window_shown();
+            *slot.borrow_mut() = Some(window);
+        })
+    };
+
+    let open_requested = std::sync::Arc::new(AtomicBool::new(false));
     let timer = slint::Timer::default();
-    let tick = backend.clone();
-    timer.start(
-        slint::TimerMode::Repeated,
-        std::time::Duration::from_secs(1),
-        move || tick.tick(),
-    );
+    {
+        let tick = backend.clone();
+        let open = Rc::clone(&open_window);
+        let requested = open_requested.clone();
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(1),
+            move || {
+                tick.tick();
+                if requested.swap(false, Ordering::SeqCst) {
+                    open();
+                }
+            },
+        );
+    }
     if let Some(tray) = &tray {
-        let show_backend = backend.clone();
-        tray.on_show_requested(move || show_backend.surface_window());
+        let open = Rc::clone(&open_window);
+        tray.on_show_requested(move || open());
         let quit_backend = backend.clone();
         tray.on_quit_requested(move || quit_backend.quit());
     }
@@ -137,30 +177,30 @@ fn main() -> Result<(), slint::PlatformError> {
     // loading the extension that publishes the StatusNotifierItem watcher; the
     // first attempt above may therefore have failed. A silent start without a
     // tray would be unreachable, so keep retrying for a minute and only then
-    // fall back to showing the window.
+    // build the window instead.
     let late_tray: Rc<RefCell<Option<AppTray>>> = Rc::new(RefCell::new(None));
     let tray_retry = Rc::new(slint::Timer::default());
     if tray.is_none() {
         let slot = Rc::clone(&late_tray);
-        let timer = Rc::clone(&tray_retry);
+        let timer_handle = Rc::clone(&tray_retry);
         let attempts = Rc::new(Cell::new(0u32));
-        let app_weak = app.as_weak();
+        let tray_available = Rc::clone(&tray_available);
         let backend = backend.clone();
         let silent = options.silent;
+        let open = Rc::clone(&open_window);
         tray_retry.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(2),
             move || {
                 if slot.borrow().is_some() {
-                    timer.stop();
+                    timer_handle.stop();
                     return;
                 }
                 attempts.set(attempts.get() + 1);
                 if attempts.get() > 30 {
-                    timer.stop();
-                    if silent && let Some(app) = app_weak.upgrade() {
-                        let _ = app.show();
-                        backend.note_window_shown();
+                    timer_handle.stop();
+                    if silent {
+                        open();
                     }
                     return;
                 }
@@ -170,65 +210,25 @@ fn main() -> Result<(), slint::PlatformError> {
                 let Some(new_tray) = AppTray::new().ok() else {
                     return;
                 };
-                let show_backend = backend.clone();
-                new_tray.on_show_requested(move || show_backend.surface_window());
+                let open = Rc::clone(&open);
+                new_tray.on_show_requested(move || open());
                 let quit_backend = backend.clone();
                 new_tray.on_quit_requested(move || quit_backend.quit());
                 backend.set_tray(Some(&new_tray));
-                if let Some(app) = app_weak.upgrade() {
-                    app.set_tray_available(true);
-                }
+                tray_available.set(true);
                 let _ = new_tray.show();
                 *slot.borrow_mut() = Some(new_tray);
-                timer.stop();
+                timer_handle.stop();
             },
         );
     }
 
-    // Custom title bar: dragging starts a compositor-side move; the buttons
-    // minimize to the taskbar and close per the "keep running" option.
-    let drag_app = app.as_weak();
-    app.on_drag_window_requested(move || {
-        if let Some(app) = drag_app.upgrade() {
-            let _ = app.window().with_winit_window(|window| {
-                let _ = window.drag_window();
-            });
-        }
-    });
-    let minimize_backend = backend.clone();
-    app.on_minimize_requested(move || minimize_backend.request_minimize());
-    let close_window_backend = backend.clone();
-    app.on_close_window_requested(move || close_window_backend.request_close());
+    // Launching the executable again surfaces the window (built on demand).
+    let activate_requested = open_requested.clone();
+    instance.listen(move || activate_requested.store(true, Ordering::SeqCst));
 
-    // Slint's default response to the close button is to hide the window. That
-    // is only half of what the "关闭到托盘" option means, so the decision is taken
-    // here: hide when the option is on, and otherwise hand over to the normal
-    // shutdown path — which logs out first and only then ends the event loop.
-    // Returning `KeepWindowShown` in both cases is deliberate: the backend has
-    // already minimized the window, and Slint's own `HideWindow` reaction destroys
-    // the surface on Wayland (winit cannot hide there), which is what left an
-    // unopenable entry in the dock. The quit branch keeps the window until logout.
-    let close_backend = backend.clone();
-    app.window().on_close_requested(move || {
-        close_backend.request_close();
-        slint::CloseRequestResponse::KeepWindowShown
-    });
-
-    // Launching the executable again surfaces the window that is already
-    // running — which is usually hidden in the tray — instead of adding a
-    // second icon nobody can tell apart.
-    let activate_backend = backend.clone();
-    instance.listen(move || {
-        let backend = activate_backend.clone();
-        let _ = slint::invoke_from_event_loop(move || backend.surface_window());
-    });
-
-    // Silent start: the window is created (so the session can put login failures
-    // and the tray tooltip somewhere) but stays hidden. A second launch of the
-    // binary surfaces it through the single-instance handover.
     if !options.silent {
-        app.show()?;
-        backend.note_window_shown();
+        open_window();
     }
     if let Some(tray) = &tray {
         tray.show()?;
@@ -238,6 +238,38 @@ fn main() -> Result<(), slint::PlatformError> {
     // tray. Shutdown is always explicit — the close button when the option says
     // "quit", the tray menu, or the session's logout flow.
     slint::run_event_loop_until_quit()
+}
+
+/// Wires the callbacks that belong to the window itself (title bar drag, the
+/// two window buttons and the window-manager close request).
+///
+/// Called once per window instance: the window is created on demand and may be
+/// rebuilt, so these cannot be registered once at start-up.
+fn attach_window_callbacks(app: &AppWindow, backend: &std::sync::Arc<ui_backend::Backend>) {
+    // Custom title bar: dragging starts a compositor-side move; the buttons
+    // minimize to the tray/taskbar and close per the "keep running" option.
+    let drag_app = app.as_weak();
+    app.on_drag_window_requested(move || {
+        if let Some(app) = drag_app.upgrade() {
+            let _ = app.window().with_winit_window(|window| {
+                let _ = window.drag_window();
+            });
+        }
+    });
+    let minimize_backend = std::sync::Arc::clone(backend);
+    app.on_minimize_requested(move || minimize_backend.request_minimize());
+    let close_backend = std::sync::Arc::clone(backend);
+    app.on_close_window_requested(move || close_backend.request_close());
+
+    // Slint's default response to the close button is to hide the window. The
+    // backend decides between "keep running in the background" and the logout
+    // path; KeepWindowShown stops Slint from additionally destroying the
+    // surface, which is what used to leave an unopenable dock entry.
+    let close_request_backend = std::sync::Arc::clone(backend);
+    app.window().on_close_requested(move || {
+        close_request_backend.request_close();
+        slint::CloseRequestResponse::KeepWindowShown
+    });
 }
 
 /// Whether this desktop can host Slint's Linux tray backend.

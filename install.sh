@@ -31,7 +31,7 @@
 set -euo pipefail
 
 REPO="ZincGluxx/drcom-rs"
-DEFAULT_VERSION="1.2.6"
+DEFAULT_VERSION="1.2.7"
 ASSET_PREFIX="drcom-campus-linux-x86_64"
 MIRRORS=(
     "https://ghproxy.net"
