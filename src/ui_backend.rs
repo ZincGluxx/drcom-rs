@@ -167,8 +167,11 @@ pub struct Backend {
     /// The tray icon is a separate Slint component, so the only way to keep its
     /// tooltip in step with the session is to hold a handle to it here. It is
     /// absent when the desktop cannot host a StatusNotifierItem, and the code
-    /// then keeps the window visible instead of hiding it.
-    tray: Option<slint::Weak<AppTray>>,
+    /// then keeps the window visible instead of hiding it. The slot is mutable
+    /// because a login autostart can reach the program before the desktop has
+    /// published its StatusNotifierWatcher: the entry point retries for a while
+    /// and installs the tray icon here once it exists.
+    tray: Mutex<Option<slint::Weak<AppTray>>>,
     shared: Arc<Mutex<Shared>>,
     /// Settings read from `drcom.ini` at startup. The prototype had no place to
     /// keep them, which is why the server list had to come from an environment
@@ -177,6 +180,22 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Whether a tray icon is currently registered.
+    fn tray_present(&self) -> bool {
+        self.tray.lock().map(|tray| tray.is_some()).unwrap_or(false)
+    }
+
+    /// Installs (or clears) the tray icon after start-up.
+    ///
+    /// The login autostart may beat the desktop's StatusNotifierItem extension;
+    /// the entry point waits for the watcher and then hands the freshly built
+    /// tray component over here, so the program still ends up in the tray.
+    pub fn set_tray(&self, tray: Option<&AppTray>) {
+        if let Ok(mut slot) = self.tray.lock() {
+            *slot = tray.map(|tray| tray.as_weak());
+        }
+    }
+
     /// Wires the window callbacks, fills the adapter panel, and seeds the login
     /// form from the configuration file.
     pub fn attach(window: &AppWindow, tray: Option<&AppTray>, start_hidden: bool) -> Self {
@@ -190,7 +209,7 @@ impl Backend {
         }
         let backend = Self {
             window: window.as_weak(),
-            tray: tray.map(|tray| tray.as_weak()),
+            tray: Mutex::new(tray.map(|tray| tray.as_weak())),
             shared: Arc::new(Mutex::new(Shared {
                 window_backgrounded: start_hidden,
                 ..Shared::default()
@@ -315,7 +334,27 @@ impl Backend {
                         window.set_start_with_windows(enabled);
                     }
                 }
+                // Saving with "自动登录" on and complete credentials should
+                // log in right away and (after the usual three-second delay)
+                // tuck the window into the tray, instead of waiting for the
+                // user to press 连接 and then close the window by hand.
+                let auto_started = result.is_ok()
+                    && prefs.auto_login
+                    && !prefs.username.is_empty()
+                    && !prefs.password.is_empty()
+                    && save
+                        .shared
+                        .lock()
+                        .is_ok_and(|shared| shared.stop.is_none() && !shared.quitting);
+                if auto_started {
+                    save.start(
+                        prefs.username.clone(),
+                        prefs.password.clone(),
+                        prefs.auto_reconnect,
+                    );
+                }
                 save.set_status(&match result {
+                    Ok(()) if auto_started => "设置已保存，正在自动登录".into(),
                     Ok(()) => "设置已保存（自动登录在下次启动时生效）".into(),
                     Err(e) => e,
                 });
@@ -348,7 +387,7 @@ impl Backend {
         {
             shared.hide_at = None;
             drop(shared);
-            let note = if self.tray.is_some() {
+            let note = if self.tray_present() {
                 "登录成功，已最小化到托盘"
             } else {
                 "登录成功，已最小化到任务栏并在后台保活"
@@ -619,7 +658,7 @@ impl Backend {
     fn clone_handle(&self) -> Self {
         Self {
             window: self.window.clone(),
-            tray: self.tray.clone(),
+            tray: Mutex::new(self.tray.lock().ok().and_then(|tray| tray.clone())),
             shared: Arc::clone(&self.shared),
             settings: Arc::clone(&self.settings),
         }
@@ -711,7 +750,7 @@ impl Backend {
         if let Ok(mut shared) = self.shared.lock() {
             shared.window_backgrounded = true;
         }
-        let has_tray = self.tray.is_some();
+        let has_tray = self.tray_present();
         let window = self.window.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(window) = window.upgrade() else {
@@ -740,7 +779,7 @@ impl Backend {
     /// closing does there; without one it minimizes to the taskbar, where the
     /// window stays restorable.
     pub fn request_minimize(&self) {
-        if self.tray.is_some() {
+        if self.tray_present() {
             event_log::record("最小化：最小化到托盘");
             self.hide_to_tray("已最小化到托盘");
         } else {
@@ -833,7 +872,7 @@ impl Backend {
             shared.hide_at = None;
         }
         if minimize {
-            if self.tray.is_some() {
+            if self.tray_present() {
                 event_log::record("关闭窗口：按设置最小化到托盘");
                 self.hide_to_tray("已最小化到托盘/任务栏");
             } else {
@@ -851,7 +890,7 @@ impl Backend {
         // Shell tooltips clip a long string without any ellipsis, so the useful
         // part has to be the front of it.
         let note: String = note.chars().take(48).collect();
-        let Some(tray) = self.tray.clone() else {
+        let Some(tray) = self.tray.lock().ok().and_then(|tray| tray.clone()) else {
             return;
         };
         let text = format!("DrCom 校园网助手 - {note}");
@@ -1224,7 +1263,7 @@ impl Backend {
                     self.set_online_duration("0 秒");
                     // The window is about to disappear, so the tray (when there is
                     // one) has to carry the news as well.
-                    self.set_tooltip_text(match (minimize, self.tray.is_some()) {
+                    self.set_tooltip_text(match (minimize, self.tray_present()) {
                         (true, true) => "已连接，稍后最小化到托盘",
                         (true, false) => "已连接，稍后转入后台静默运行",
                         (false, _) => "已连接，正在保持在线",

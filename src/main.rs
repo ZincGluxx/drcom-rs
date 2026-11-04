@@ -16,6 +16,9 @@ mod ui_backend;
 
 slint::include_modules!();
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use slint::ComponentHandle;
 use slint::winit_030::WinitWindowAccessor;
 
@@ -97,6 +100,12 @@ fn main() -> Result<(), slint::PlatformError> {
     // example) fails to create one. The window must still start, so the tray is
     // optional — `tray-available` makes the UI quit on close instead of hiding
     // into a tray that does not exist.
+    // A login autostart can start before the desktop has published its
+    // StatusNotifierWatcher (GNOME loads the AppIndicator extension
+    // asynchronously). The first attempt is made here and a background retry
+    // installs the tray a moment later, so the process still ends up with a
+    // tray icon instead of running invisibly and forcing the user to start it
+    // by hand.
     let tray = if status_notifier_available() {
         AppTray::new().ok()
     } else {
@@ -122,6 +131,58 @@ fn main() -> Result<(), slint::PlatformError> {
         tray.on_show_requested(move || show_backend.surface_window());
         let quit_backend = backend.clone();
         tray.on_quit_requested(move || quit_backend.quit());
+    }
+
+    // Retry tray creation in the background. At login the desktop can still be
+    // loading the extension that publishes the StatusNotifierItem watcher; the
+    // first attempt above may therefore have failed. A silent start without a
+    // tray would be unreachable, so keep retrying for a minute and only then
+    // fall back to showing the window.
+    let late_tray: Rc<RefCell<Option<AppTray>>> = Rc::new(RefCell::new(None));
+    let tray_retry = Rc::new(slint::Timer::default());
+    if tray.is_none() {
+        let slot = Rc::clone(&late_tray);
+        let timer = Rc::clone(&tray_retry);
+        let attempts = Rc::new(Cell::new(0u32));
+        let app_weak = app.as_weak();
+        let backend = backend.clone();
+        let silent = options.silent;
+        tray_retry.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(2),
+            move || {
+                if slot.borrow().is_some() {
+                    timer.stop();
+                    return;
+                }
+                attempts.set(attempts.get() + 1);
+                if attempts.get() > 30 {
+                    timer.stop();
+                    if silent && let Some(app) = app_weak.upgrade() {
+                        let _ = app.show();
+                        backend.note_window_shown();
+                    }
+                    return;
+                }
+                if !status_notifier_available() {
+                    return;
+                }
+                let Some(new_tray) = AppTray::new().ok() else {
+                    return;
+                };
+                let show_backend = backend.clone();
+                new_tray.on_show_requested(move || show_backend.surface_window());
+                let quit_backend = backend.clone();
+                new_tray.on_quit_requested(move || quit_backend.quit());
+                backend.set_tray(Some(&new_tray));
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_tray_available(true);
+                }
+                let _ = new_tray.show();
+                *slot.borrow_mut() = Some(new_tray);
+                timer.stop();
+            },
+        );
     }
 
     // Custom title bar: dragging starts a compositor-side move; the buttons
