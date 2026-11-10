@@ -1,255 +1,145 @@
-//! Glue between the Slint window and the authentication session.
+//! Glue between the Slint window and the application service.
 //!
-//! The window runs on Slint's event loop thread, while a session blocks on
-//! socket timeouts, so the session lives on its own thread and every property
-//! update is marshalled back with `invoke_from_event_loop`. Shared state is
-//! limited to the stop flag and the connected-since timestamp, which is what
-//! "断开" and the online-duration label need.
+//! Everything that decides *what* the client is doing lives in `drcom-service`.
+//! This module only mirrors its snapshots into the window and turns window
+//! callbacks into commands; no session, preference or diagnostics logic is
+//! duplicated here.
+//!
+//! Notifications arrive on the thread that caused the change, so they are
+//! marshalled into Slint's event loop before touching a component. The window is
+//! built on demand and released when it goes to the tray (see `main.rs`), which is
+//! why the service — not the component — is the source of truth a rebuilt window
+//! replays.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
+use drcom_core::event_log;
+use drcom_service::{
+    Command, CommandOutcome, FormSeed, Notification, ProbeKind, Service, Snapshot,
+};
 use slint::ComponentHandle;
 
-use drcom_campus::adapter;
-use drcom_campus::config::ClientConfig;
-use drcom_campus::event_log;
-use drcom_campus::page_status::{self, CampusPage};
-use drcom_campus::preferences::{self, Preferences};
-use drcom_campus::session::{
-    LoginSession, SessionConfig, SessionError, SessionEvent, SessionPhase,
-};
+use crate::{AppTray, AppWindow, platform};
 
-use crate::{AppTray, AppWindow};
-
-/// How long the window stays visible after a successful login before it tucks
-/// itself into the tray. The C# client waits the same three seconds, so the user
-/// sees the success state instead of watching the window vanish on the same frame
-/// the reply arrived.
-const HIDE_AFTER_LOGIN: Duration = Duration::from_secs(3);
-
-/// A session that stayed up this long counts as working, so the following
-/// automatic reconnect starts from the first, short delay again.
-const STABLE_SESSION: Duration = Duration::from_secs(60);
-
-/// Granularity of the wait between reconnect attempts; also bounds how long a
-/// stop request takes to be honoured.
-const SLEEP_STEP: Duration = Duration::from_millis(100);
-
-/// Delay between automatic reconnect attempts.
-///
-/// The reference client re-authenticates on a fixed schedule, which for a link
-/// that is down for an afternoon means a login frame every few seconds for hours
-/// — pointless, and hard on an authentication server that is shared by a whole
-/// building. Doubling up to a ceiling keeps the first recovery quick without
-/// letting a long outage turn into a flood.
-struct ReconnectBackoff {
-    next: Duration,
-}
-
-impl ReconnectBackoff {
-    const FIRST: Duration = Duration::from_secs(5);
-    const CEILING: Duration = Duration::from_secs(120);
-
-    fn new() -> Self {
-        Self { next: Self::FIRST }
-    }
-
-    /// Back to the first step, after a session that actually held.
-    fn reset(&mut self) {
-        self.next = Self::FIRST;
-    }
-
-    /// The delay to use now, and the longer one after it.
-    fn next_delay(&mut self) -> Duration {
-        let current = self.next;
-        self.next = (current * 2).min(Self::CEILING);
-        current
-    }
-}
-
-struct Shared {
-    stop: Option<Arc<AtomicBool>>,
-    reconnect_allowed: Arc<AtomicBool>,
-    connected_since: Option<Instant>,
-    pending_auto: Option<(Preferences, Instant)>,
-    page_probe_pending: bool,
-    /// When the window should tuck itself away after a successful login. The C#
-    /// client waits three seconds so the user actually sees the success state
-    /// before the window disappears; hiding on the same frame as the reply reads
-    /// as a crash.
-    hide_at: Option<Instant>,
-    /// Mirror of the "关闭到托盘" option for the session thread, which cannot read
-    /// the window.
-    minimize_to_tray: bool,
-    quitting: bool,
-    probing: bool,
-    edit_adapter: Option<adapter::AdapterInfo>,
-    network_busy: bool,
-    /// Everything below mirrors what the window is showing. The window can be
-    /// closed to the tray at any moment, so the backend — not the component — has
-    /// to be the source of truth for a window that is built later.
-    config_status: Option<String>,
-    autostart: Option<bool>,
-    remembered: Option<Preferences>,
-    connection_state: String,
-    status_detail: String,
-    campus_page_status: String,
-    last_failure: LastFailure,
-    startup_complaint: Option<String>,
-    /// Set when the window is sent back to the tray. The event loop owns the
-    /// component and therefore owns the release itself; a background thread (the
-    /// session, the auto-hide after a login) can only record that it is due.
-    release_requested: bool,
-}
-
-/// The failure card on the login page, kept in the backend so reopening the
-/// window still shows why the last attempt failed.
-#[derive(Debug, Clone, Default)]
-struct LastFailure {
-    text: String,
-    time: String,
-    stage: String,
-    code: String,
-    duration: String,
-    retry: String,
-}
-
-impl Default for Shared {
-    fn default() -> Self {
-        Self {
-            stop: None,
-            reconnect_allowed: Arc::new(AtomicBool::new(false)),
-            connected_since: None,
-            pending_auto: None,
-            page_probe_pending: false,
-            hide_at: None,
-            // Same default as the C# client's `MinimizeToTray`.
-            minimize_to_tray: true,
-            quitting: false,
-            probing: false,
-            edit_adapter: None,
-            network_busy: false,
-            config_status: None,
-            autostart: None,
-            remembered: None,
-            connection_state: "未连接".to_string(),
-            status_detail: String::new(),
-            campus_page_status: String::new(),
-            last_failure: LastFailure::default(),
-            startup_complaint: None,
-            release_requested: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PageProbeOutcome {
-    app_session_active: bool,
-    canceled_auto_login: bool,
-}
-
-fn reconcile_page_probe_state(shared: &mut Shared, page: CampusPage) -> PageProbeOutcome {
-    shared.page_probe_pending = false;
-    let app_session_active = shared.stop.is_some() || shared.connected_since.is_some();
-    let canceled_auto_login = !app_session_active
-        && page == CampusPage::CurrentSession
-        && shared.pending_auto.take().is_some();
-    PageProbeOutcome {
-        app_session_active,
-        canceled_auto_login,
-    }
-}
-
-fn retry_attempt_admitted(first_attempt: bool, reconnect_allowed: bool, stopped: bool) -> bool {
-    !stopped && (first_attempt || reconnect_allowed)
-}
-
-fn page_probe_status(page: CampusPage, failed: bool, outcome: PageProbeOutcome) -> &'static str {
-    if failed || page == CampusPage::Unknown {
-        "网页状态未知；此程序连接状态未更改"
-    } else if outcome.app_session_active {
-        match page {
-            CampusPage::CurrentSession | CampusPage::LoginSucceeded => {
-                "此程序会话由左上角连接状态和 UDP 保活管理"
-            }
-            CampusPage::LoginForm => "网页返回登录表单；此程序 UDP 保活状态见左上角",
-            CampusPage::LoginRejected => "网页返回认证失败页；不代表 UDP 会话状态",
-            CampusPage::Unknown => "网页状态未知；此程序连接状态未更改",
-        }
-    } else {
-        match page {
-            CampusPage::LoginForm => "网页返回登录表单；此程序尚未建立 UDP 保活",
-            CampusPage::CurrentSession => "网页显示已有认证（外部会话）；此程序未建立 UDP 保活",
-            CampusPage::LoginRejected => "网页返回认证失败页；不代表 UDP 会话状态",
-            CampusPage::LoginSucceeded => "网页返回登录成功页；无法确认当前在线",
-            CampusPage::Unknown => "网页状态未知；此程序连接状态未更改",
-        }
-    }
-}
+/// Shell tooltips clip a long string without any ellipsis, so the useful part has
+/// to be the front of the note.
+const TOOLTIP_NOTE_CHARS: usize = 48;
 
 pub struct Backend {
+    /// The frontend's whole application backend. Cheap to clone, safe to call
+    /// from any thread, and the only thing that knows the session state.
+    service: Service,
     /// The window is created on demand and dropped again when the user closes it
-    /// to the tray, so anything that outlives a single window — the session
-    /// thread, the page probe, the tray callbacks — has to look the window up
-    /// here instead of capturing one. Slint keeps the render target for as long
-    /// as the component exists, and that target is the largest single block this
-    /// process commits.
+    /// to the tray, so anything that outlives a single window — service
+    /// notifications, the tray, the release timer — looks the window up here
+    /// instead of capturing one. Slint keeps the render target for as long as the
+    /// component exists, and that target is the largest single block this process
+    /// commits.
     ui: Arc<Mutex<slint::Weak<AppWindow>>>,
     /// The tray icon is a separate Slint component, so the only way to keep its
-    /// tooltip in step with the session is to hold a handle to it here.
+    /// tooltip in step with the backend is to hold a handle to it here.
     tray: slint::Weak<AppTray>,
-    shared: Arc<Mutex<Shared>>,
-    /// Settings read from `drcom.ini` at startup. The prototype had no place to
-    /// keep them, which is why the server list had to come from an environment
-    /// variable that a GUI launch never has.
-    settings: Arc<ClientConfig>,
+    /// Set when the backend asked for the window to go to the tray. The event
+    /// loop owns the component and therefore the release itself; a notification
+    /// from a session thread can only record that the release is due.
+    release_requested: Arc<AtomicBool>,
+}
+
+impl Clone for Backend {
+    fn clone(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            ui: Arc::clone(&self.ui),
+            tray: self.tray.clone(),
+            release_requested: Arc::clone(&self.release_requested),
+        }
+    }
 }
 
 impl Backend {
-    /// The window currently on screen, if any. Running with no window at all is a
-    /// normal state here: the process lives in the tray and only builds a window
-    /// when the user asks for one.
-    fn ui(&self) -> Option<AppWindow> {
-        self.ui_weak().upgrade()
+    /// Wires the service into the tray and the (yet to be built) window.
+    pub fn new(tray: &AppTray, service: Service) -> Self {
+        let backend = Self {
+            service,
+            ui: Arc::new(Mutex::new(slint::Weak::default())),
+            tray: tray.as_weak(),
+            release_requested: Arc::new(AtomicBool::new(false)),
+        };
+        backend.subscribe();
+        backend
     }
 
-    fn ui_weak(&self) -> slint::Weak<AppWindow> {
-        match self.ui.lock() {
-            Ok(slot) => slot.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+    /// Every service notification is marshalled onto the Slint thread; the sink
+    /// itself never touches a component.
+    fn subscribe(&self) {
+        let ui = Arc::clone(&self.ui);
+        let tray = self.tray.clone();
+        let release_requested = Arc::clone(&self.release_requested);
+        let sink = Arc::new(move |notification: Notification| {
+            let ui = Arc::clone(&ui);
+            let tray = tray.clone();
+            let release_requested = Arc::clone(&release_requested);
+            let _ = slint::invoke_from_event_loop(move || match notification {
+                Notification::State { snapshot } => {
+                    if let Some(window) = upgrade(&ui) {
+                        apply_snapshot(&window, &snapshot);
+                    }
+                    // The tray is the only visible part of the program while the
+                    // window is in the tray, so the status line has to follow the
+                    // service there too — including when no window exists at all.
+                    if !snapshot.tooltip.is_empty() {
+                        set_tray_tooltip(&tray, &snapshot.tooltip);
+                    }
+                }
+                Notification::HideToTray { note } => {
+                    request_hide_to_tray(&ui, &tray, &release_requested, &note);
+                }
+                Notification::ExitReady => {
+                    let _ = slint::quit_event_loop();
+                }
+            });
+        });
+        self.service.subscribe(sink);
     }
 
-    /// Publishes a freshly built window to everything that pushes updates into it,
-    /// replays the state it is supposed to show, and wires its callbacks. Called on
-    /// every open, not just the first one: each open builds a new component, so
-    /// the callbacks the previous one carried went away with it.
+    /// Publishes a freshly built window, replays the state it is supposed to
+    /// show, and wires its callbacks. Called on every open, not just the first
+    /// one: each open builds a new component, so the callbacks the previous one
+    /// carried went away with it.
     pub fn bind(&self, window: &AppWindow) {
+        self.publish(window);
+
+        // The form seed is the one source of a saved password, and it is applied
+        // only here. State pushes must not overwrite what the user is typing.
+        seed_form(window, &self.service.form_seed());
+        apply_snapshot(window, &self.service.snapshot());
+        self.attach_callbacks(window);
+    }
+
+    fn publish(&self, window: &AppWindow) {
         match self.ui.lock() {
             Ok(mut slot) => *slot = window.as_weak(),
             Err(poisoned) => *poisoned.into_inner() = window.as_weak(),
         }
-        self.seed_window(window);
-        self.attach_callbacks(window);
+    }
+
+    /// The window currently on screen, if any. Running with no window at all is a
+    /// normal state here: the process lives in the tray and only builds a window
+    /// when the user asks for one.
+    fn ui(&self) -> Option<AppWindow> {
+        upgrade(&self.ui)
     }
 
     /// Takes the pending "send the window to the tray" request, if any. Whoever
     /// takes it is responsible for hiding and releasing the component.
     pub fn take_release_request(&self) -> bool {
-        match self.shared.lock() {
-            Ok(mut shared) => std::mem::take(&mut shared.release_requested),
-            Err(poisoned) => std::mem::take(&mut poisoned.into_inner().release_requested),
-        }
+        self.release_requested.swap(false, Ordering::Relaxed)
     }
 
     /// Forgets a request that a rebuilt window has already satisfied.
     pub fn clear_release_request(&self) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.release_requested = false;
-        }
+        self.release_requested.store(false, Ordering::Relaxed);
     }
 
     /// Drops the handle so a window that is going away stops receiving writes.
@@ -260,623 +150,11 @@ impl Backend {
         }
     }
 
-    /// Reads the configuration and the saved preferences and builds the half of
-    /// the backend that outlives every window. Anything that has to survive the
-    /// window being closed belongs here rather than in `seed_window`.
-    pub fn new(tray: &AppTray) -> Self {
-        let (settings, complaint) = match load_settings() {
-            Ok(settings) => (settings, None),
-            Err(message) => (ClientConfig::default(), Some(message)),
-        };
-        let backend = Self {
-            ui: Arc::new(Mutex::new(slint::Weak::default())),
-            tray: tray.as_weak(),
-            shared: Arc::new(Mutex::new(Shared::default())),
-            settings: Arc::new(settings),
-        };
-        event_log::record(&format!(
-            "启动 DrCom Rust {}，配置文件：{}",
-            env!("CARGO_PKG_VERSION"),
-            match drcom_campus::config::discover() {
-                Some(path) => path.display().to_string(),
-                None => "无（使用内置认证服务器）".to_string(),
-            }
-        ));
-        {
-            let mut shared = backend.shared.lock().unwrap();
-            if let Some(complaint) = complaint {
-                shared.startup_complaint = Some(complaint);
-            }
-            match preferences::path().and_then(|path| preferences::load(&path)) {
-                Ok(prefs) => {
-                    shared.minimize_to_tray = prefs.minimize_to_tray;
-                    shared.config_status = if prefs.username.is_empty() {
-                        None
-                    } else {
-                        Some("已记住你的账号".to_string())
-                    };
-                    let auto_ready = !prefs.username.is_empty() && !prefs.password.is_empty();
-                    if shared.startup_complaint.is_none() && prefs.auto_login && auto_ready {
-                        shared.pending_auto =
-                            Some((prefs.clone(), Instant::now() + Duration::from_secs(90)));
-                    }
-                    shared.remembered = Some(prefs);
-                }
-                Err(_) => {
-                    shared.config_status = Some("读取失败，请重新保存账号".to_string());
-                }
-            }
-            shared.autostart = match preferences::autostart::enabled() {
-                Ok(enabled) => Some(enabled),
-                Err(_) => {
-                    shared.config_status = Some("无法读取开机启动状态".to_string());
-                    None
-                }
-            };
-        }
-        if let Some(complaint) = backend.shared.lock().unwrap().startup_complaint.clone() {
-            backend.remember_failure_text(&complaint);
-            backend.set_connection("未连接", &complaint);
-        }
-        // One probe per launch, with or without a window: the answer is kept in
-        // `shared` and replayed into whichever window is opened next.
-        backend.start_page_probe();
-        backend
-    }
-
-    /// Replays what the window should show right now. Run on every open, so a
-    /// window that was closed to the tray and reopened is not a blank slate.
-    fn seed_window(&self, window: &AppWindow) {
-        if !self.settings.account.is_empty() {
-            window.set_username(self.settings.account.clone().into());
-            window.set_password(self.settings.password.clone().into());
-        }
-        let (config_status, autostart, remembered, connection, detail, page, failure, minimize) = {
-            let shared = self.shared.lock().unwrap();
-            (
-                shared.config_status.clone(),
-                shared.autostart,
-                shared.remembered.clone(),
-                shared.connection_state.clone(),
-                shared.status_detail.clone(),
-                shared.campus_page_status.clone(),
-                shared.last_failure.clone(),
-                shared.minimize_to_tray,
-            )
-        };
-        if let Some(prefs) = remembered {
-            if !prefs.username.is_empty() {
-                window.set_username(prefs.username.clone().into());
-            }
-            if let Some(password) = saved_password_for_form(&prefs) {
-                window.set_password(password.into());
-            }
-            window.set_auto_login(prefs.auto_login);
-            window.set_auto_reconnect(prefs.auto_reconnect);
-        }
-        window.set_minimize_to_tray(minimize);
-        if let Some(enabled) = autostart {
-            window.set_start_with_windows(enabled);
-        }
-        if let Some(status) = config_status {
-            window.set_config_status(status.into());
-        }
-        window.set_connection_state(connection.clone().into());
-        window.set_online(connection == "已连接");
-        window.set_session_active(connection != "未连接");
-        window.set_status_detail(detail.into());
-        window.set_campus_page_status(page.into());
-        window.set_last_failure(failure.text.into());
-        window.set_last_failure_time(failure.time.into());
-        window.set_last_failure_stage(failure.stage.into());
-        window.set_last_failure_code(failure.code.into());
-        window.set_last_failure_duration(failure.duration.into());
-        window.set_last_failure_retry(failure.retry.into());
-        if let Some(start) = self.shared.lock().unwrap().connected_since {
-            window.set_duration(format_duration(start.elapsed()).into());
-        }
-        self.refresh_adapter(None);
-    }
-
-    /// Wires the window callbacks, fills the adapter panel, and seeds the login
-    /// form from the configuration file.
-    fn attach_callbacks(&self, window: &AppWindow) {
-        let backend = self.clone_handle();
-
-        let connect = backend.clone_handle();
-        window.on_connect_requested(move |username, password, auto_reconnect| {
-            connect.start(username.to_string(), password.to_string(), auto_reconnect);
-        });
-
-        let disconnect = backend.clone_handle();
-        window.on_disconnect_requested(move || disconnect.stop());
-
-        let refresh = backend.clone_handle();
-        window.on_refresh_requested(move || refresh.refresh_adapter(None));
-        let probe = backend.clone_handle();
-        window.on_probe_requested(move |kind| probe.probe(kind));
-        let network = backend.clone_handle();
-        window.on_network_settings_requested(move || network.open_network_editor());
-        let apply = backend.clone_handle();
-        window.on_apply_network_requested(move |ip, mask, gateway, dns| {
-            apply.apply_network(&ip, &mask, &gateway, &dns)
-        });
-        let system = backend.clone_handle();
-        window.on_system_network_requested(move || {
-            if let Err(error) = crate::diagnostics::open_network_settings() {
-                system.set_status(&format!("无法打开网络设置：{error}"));
-            }
-        });
-        let copy = backend.clone_handle();
-        window.on_copy_requested(move || {
-            if let Some(window) = copy.ui() {
-                match crate::diagnostics::copy(&diagnostics_report(&window, &copy.settings)) {
-                    Ok(()) => copy.set_status("诊断已复制（不包含账号密码）"),
-                    Err(error) => copy.set_status(&format!("复制失败：{error}")),
-                }
-            }
-        });
-
-        let save = backend.clone_handle();
-        window.on_save_requested(
-            move |username, password, auto_login, auto_reconnect, autostart, minimize_to_tray| {
-                let prefs = Preferences {
-                    username: username.trim().to_string(),
-                    password: password.to_string(),
-                    password_cleared: password.is_empty(),
-                    auto_login,
-                    auto_reconnect,
-                    minimize_to_tray,
-                };
-                let result = (|| -> Result<(), String> {
-                    validate_preferences(&prefs, save.settings.servers_or_env())?;
-                    let path = preferences::path().map_err(|e| e.to_string())?;
-                    preferences::save(&path, &prefs).map_err(|e| format!("保存失败：{e}"))?;
-                    preferences::autostart::set(autostart)
-                        .map_err(|e| format!("账号已保存，但开机启动设置失败：{e}"))?;
-                    Ok(())
-                })();
-                // The close button reads this option live, so it takes effect
-                // immediately rather than at the next launch like auto-login.
-                if let Ok(mut shared) = save.shared.lock() {
-                    shared.minimize_to_tray = minimize_to_tray;
-                    if !minimize_to_tray {
-                        shared.hide_at = None;
-                    }
-                }
-                if let Some(window) = save.ui() {
-                    window.set_config_status(
-                        if result.is_ok() {
-                            "账号已安全保存"
-                        } else {
-                            "保存未完成"
-                        }
-                        .into(),
-                    );
-                    if let Ok(enabled) = preferences::autostart::enabled() {
-                        window.set_start_with_windows(enabled);
-                    }
-                }
-                save.set_status(&match result {
-                    Ok(()) => "设置已保存（自动登录在下次启动时生效）".into(),
-                    Err(e) => e,
-                });
-            },
-        );
-
-        let export = backend.clone_handle();
-        window.on_export_requested(move || export.export_diagnostics());
-        let clear_password = backend.clone_handle();
-        window.on_clear_password_requested(move || clear_password.clear_saved_password());
-    }
-
+    /// One second of housekeeping. The duration refresh and the auto-hide after a
+    /// login run inside the service; the event loop only has to keep the clock,
+    /// then release the window it may have been asked to hide.
     pub fn tick(&self) {
-        let mut shared = self.shared.lock().unwrap();
-        if shared.quitting {
-            return;
-        }
-        if let Some(start) = shared.connected_since
-            && let Some(window) = self.ui()
-            && window.window().is_visible()
-        {
-            window.set_duration(format_duration(start.elapsed()).into());
-        }
-        // The hide-after-login delay runs off this one-second timer rather than a
-        // second timer of its own.
-        if let Some(due) = shared.hide_at
-            && Instant::now() >= due
-        {
-            shared.hide_at = None;
-            drop(shared);
-            self.hide_to_tray("登录成功，已在托盘运行");
-            return;
-        }
-        if let Some((prefs, deadline)) = shared.pending_auto.clone() {
-            if shared.page_probe_pending {
-                drop(shared);
-            } else if Instant::now() > deadline {
-                shared.pending_auto = None;
-                drop(shared);
-                self.remember_failure_text("自动登录等待可用网络超时");
-                self.set_connection("未连接", "自动登录等待网卡超时，请连接网络后手动连接");
-            } else if adapter::select_for(self.settings.servers_or_env().first().copied()).is_some()
-            {
-                shared.pending_auto = None;
-                drop(shared);
-                self.start(prefs.username, prefs.password, prefs.auto_reconnect);
-            } else {
-                drop(shared);
-                self.set_connection("等待网络", "自动登录正在等待可用网卡…");
-            }
-        }
-    }
-
-    fn start_page_probe(&self) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.page_probe_pending = true;
-        }
-        if let Some(window) = self.ui() {
-            window.set_campus_page_status("正在只读查询认证服务器首页…".into());
-        }
-        let backend = self.clone_handle();
-        let server = self.settings.servers_or_env().first().copied();
-        thread::spawn(move || {
-            let result = server.map(page_status::probe);
-            let (page, failed) = match result {
-                Some(Ok(page)) => (page, false),
-                Some(Err(_)) | None => (CampusPage::Unknown, true),
-            };
-            backend.complete_page_probe(page, failed);
-        });
-    }
-
-    fn complete_page_probe(&self, page: CampusPage, failed: bool) {
-        let outcome = if let Ok(mut shared) = self.shared.lock() {
-            reconcile_page_probe_state(&mut shared, page)
-        } else {
-            PageProbeOutcome {
-                app_session_active: false,
-                canceled_auto_login: false,
-            }
-        };
-        self.set_campus_page_status(page_probe_status(page, failed, outcome));
-
-        if outcome.canceled_auto_login {
-            event_log::record("启动网页状态显示已有认证；跳过本次自动登录，未接管外部会话");
-            self.set_status("网页显示已有认证；本程序未接管外部会话，也未启动 UDP 保活");
-        }
-    }
-
-    fn set_campus_page_status(&self, status: &str) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.campus_page_status = status.to_string();
-        }
-        let backend = self.clone_handle();
-        let status = status.to_string();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = backend.ui() {
-                window.set_campus_page_status(status.into());
-            }
-        });
-    }
-
-    fn probe(&self, kind: i32) {
-        {
-            let mut shared = self.shared.lock().unwrap();
-            if shared.probing || shared.quitting {
-                return;
-            }
-            shared.probing = true;
-        }
-        if let Some(window) = self.ui() {
-            window.set_probe_busy(true);
-        }
-        let backend = self.clone_handle();
-        let selected = match self.settings.local_ip {
-            Some(ip) => adapter::list().into_iter().find(|item| item.ipv4 == ip),
-            None => adapter::select_for(self.settings.servers_or_env().first().copied()),
-        };
-        thread::spawn(move || {
-            let (campus, ipv4, ipv6) = thread::scope(|scope| {
-                let campus =
-                    scope.spawn(|| (kind == 0 || kind == 2).then(crate::diagnostics::campus_probe));
-                let ipv4 = scope.spawn(|| {
-                    (kind == 1 || kind == 2).then(|| {
-                        crate::diagnostics::internet_probe(
-                            crate::diagnostics::Family::V4,
-                            selected.as_ref(),
-                        )
-                    })
-                });
-                let ipv6 = scope.spawn(|| {
-                    (kind == 1 || kind == 2).then(|| {
-                        crate::diagnostics::internet_probe(
-                            crate::diagnostics::Family::V6,
-                            selected.as_ref(),
-                        )
-                    })
-                });
-                (
-                    campus.join().unwrap(),
-                    ipv4.join().unwrap(),
-                    ipv6.join().unwrap(),
-                )
-            });
-            // Recorded so a user reporting "the check says IPv6 is down" leaves
-            // behind what it actually saw; otherwise the only evidence is the
-            // screenshot they did not take.
-            for (label, result) in [
-                ("校内测试", campus.as_deref()),
-                ("公网测试 IPv4", ipv4.as_deref()),
-                ("公网测试 IPv6", ipv6.as_deref()),
-            ] {
-                if let Some(text) = result {
-                    event_log::record(&format!("{label}：{text}"));
-                }
-            }
-            backend.shared.lock().unwrap().probing = false;
-            let window = backend.ui_weak();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(window) = window.upgrade() {
-                    if let Some(result) = campus {
-                        window.set_campus_result(result.into());
-                    }
-                    if let Some(result) = ipv4 {
-                        window.set_ipv4_result(result.split('｜').next().unwrap_or(&result).into());
-                    }
-                    if let Some(result) = ipv6 {
-                        window.set_ipv6_result(result.split('｜').next().unwrap_or(&result).into());
-                    }
-                    window.set_probe_busy(false);
-                }
-            });
-        });
-    }
-
-    pub fn quit(&self) {
-        let mut shared = self.shared.lock().unwrap();
-        shared.quitting = true;
-        shared.pending_auto = None;
-        shared.hide_at = None;
-        event_log::record("请求退出");
-        if shared.network_busy {
-            drop(shared);
-            self.set_status("等待网络设置操作完成后退出…");
-            return;
-        }
-        if let Some(stop) = &shared.stop {
-            stop.store(true, Ordering::Relaxed);
-            drop(shared);
-            self.set_connection("断开中", "正在下线，完成后退出…");
-        } else {
-            let _ = slint::quit_event_loop();
-        }
-    }
-
-    fn open_network_editor(&self) {
-        let mut shared = self.shared.lock().unwrap();
-        if shared.stop.is_some() || shared.quitting || shared.network_busy {
-            return;
-        }
-        let Some(found) = adapter::select_for(self.settings.servers_or_env().first().copied())
-        else {
-            drop(shared);
-            self.set_status("未找到可配置的物理网卡");
-            return;
-        };
-        shared.pending_auto = None;
-        if let Some(window) = self.ui() {
-            window.set_edit_adapter_name(found.friendly_name.clone().into());
-            window.set_edit_ip(found.ipv4.to_string().into());
-            window.set_edit_mask(
-                found
-                    .details
-                    .subnet_mask
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_default()
-                    .into(),
-            );
-            window.set_edit_gateway(
-                found
-                    .details
-                    .gateways
-                    .iter()
-                    .find(|ip| ip.is_ipv4())
-                    .map(ToString::to_string)
-                    .unwrap_or_default()
-                    .into(),
-            );
-            window.set_edit_dns(
-                found
-                    .details
-                    .dns
-                    .iter()
-                    .find(|ip| ip.is_ipv4())
-                    .map(ToString::to_string)
-                    .unwrap_or_default()
-                    .into(),
-            );
-            window
-                .set_network_message("应用时会请求管理员权限，并可能短暂中断此网卡的连接。".into());
-            window.set_network_editor_visible(true);
-        }
-        shared.edit_adapter = Some(found);
-    }
-
-    fn apply_network(&self, ip: &str, mask: &str, gateway: &str, dns: &str) {
-        let config = match crate::static_ipv4::Configuration::parse(ip, mask, gateway, dns) {
-            Ok(config) => config,
-            Err(error) => {
-                if let Some(window) = self.ui() {
-                    window.set_network_message(error.into());
-                }
-                return;
-            }
-        };
-        let mut shared = self.shared.lock().unwrap();
-        if shared.network_busy || shared.stop.is_some() || shared.quitting {
-            return;
-        }
-        let Some(found) = shared.edit_adapter.clone() else {
-            return;
-        };
-        // Confirm that the selected physical adapter still exists before elevation.
-        if !adapter::list().iter().any(|item| {
-            item.interface_index == found.interface_index
-                && item.mac == found.mac
-                && item.friendly_name == found.friendly_name
-        }) {
-            if let Some(window) = self.ui() {
-                window.set_network_message("网卡已变化，请返回后重新打开网络设置".into());
-            }
-            return;
-        }
-        shared.network_busy = true;
-        drop(shared);
-        if let Some(window) = self.ui() {
-            window.set_network_busy(true);
-            window.set_network_message("等待管理员授权与应用结果…".into());
-        }
-        let backend = self.clone_handle();
-        thread::spawn(move || {
-            let result = config.apply(&found.friendly_name);
-            let quitting = {
-                let mut shared = backend.shared.lock().unwrap();
-                shared.network_busy = false;
-                shared.quitting
-            };
-            backend.refresh_adapter(None);
-            let window = backend.ui_weak();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(window) = window.upgrade() {
-                    window.set_network_busy(false);
-                    window.set_network_message(match result {
-                        Ok(()) => "IPv4 设置已应用，可返回主界面连接".into(),
-                        Err(error) => error.into(),
-                    });
-                }
-                if quitting {
-                    let _ = slint::quit_event_loop();
-                }
-            });
-        });
-    }
-
-    fn clone_handle(&self) -> Self {
-        Self {
-            ui: Arc::clone(&self.ui),
-            tray: self.tray.clone(),
-            shared: Arc::clone(&self.shared),
-            settings: Arc::clone(&self.settings),
-        }
-    }
-
-    fn remember_failure(&self, detail: &str) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.last_failure.text = detail.to_string();
-            shared.last_failure.time = event_log::timestamp();
-        }
-        self.push_failure_card();
-    }
-
-    fn remember_failure_text(&self, detail: &str) {
-        self.remember_failure(detail);
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.last_failure.stage = "连接准备".to_string();
-            shared.last_failure.code = "LOCAL-NETWORK".to_string();
-            shared.last_failure.duration = "未开始".to_string();
-            shared.last_failure.retry = "不会自动重试".to_string();
-        }
-        self.push_failure_card();
-    }
-
-    fn remember_session_failure(
-        &self,
-        error: &SessionError,
-        elapsed: Duration,
-        retry_summary: &str,
-    ) {
-        let reason = describe_failure(error);
-        let (stage, code) = failure_stage_and_code(error);
-        self.remember_failure(&reason);
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.last_failure.stage = stage.to_string();
-            shared.last_failure.code = code.to_string();
-            shared.last_failure.duration =
-                format!("{}.{:03} 秒", elapsed.as_secs(), elapsed.subsec_millis());
-            shared.last_failure.retry = retry_summary.to_string();
-        }
-        self.push_failure_card();
-    }
-
-    /// Pushes the stored failure card into whichever window exists right now. The
-    /// card lives in the backend because the window it was first written to may
-    /// already have been closed to the tray.
-    fn push_failure_card(&self) {
-        let card = match self.shared.lock() {
-            Ok(shared) => shared.last_failure.clone(),
-            Err(poisoned) => poisoned.into_inner().last_failure.clone(),
-        };
-        let backend = self.clone_handle();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = backend.ui() {
-                window.set_last_failure(card.text.clone().into());
-                window.set_last_failure_time(card.time.clone().into());
-                window.set_last_failure_stage(card.stage.clone().into());
-                window.set_last_failure_code(card.code.clone().into());
-                window.set_last_failure_duration(card.duration.clone().into());
-                window.set_last_failure_retry(card.retry.clone().into());
-            }
-        });
-    }
-
-    fn set_status(&self, text: &str) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.status_detail = text.to_string();
-        }
-        let backend = self.clone_handle();
-        let text = text.to_string();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = backend.ui() {
-                window.set_status_detail(text.into());
-            }
-        });
-    }
-
-    fn set_connection(&self, state: &str, detail: &str) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.connection_state = state.to_string();
-            shared.status_detail = detail.to_string();
-        }
-        let backend = self.clone_handle();
-        let state = state.to_string();
-        let detail = detail.to_string();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = backend.ui() {
-                window.set_online(state == "已连接");
-                window.set_session_active(state != "未连接");
-                window.set_connection_state(state.into());
-                window.set_status_detail(detail.into());
-            }
-        });
-    }
-
-    /// Sends the window to the tray and says so in the tooltip, which is the only
-    /// part of the program still visible once the window is hidden.
-    fn hide_to_tray(&self, note: &str) {
-        self.set_tooltip_text(note);
-        // Hiding alone leaves a window whose renderer still believes its buffer
-        // holds a full frame; showing it again paints only what changed since.
-        // The event loop releases the component instead, so note it here.
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.release_requested = true;
-        }
-        let backend = self.clone_handle();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = backend.ui() {
-                let _ = window.hide();
-            }
-        });
+        self.service.tick();
     }
 
     /// Handles the window's close button. Returns `true` when the window should
@@ -891,10 +169,10 @@ impl Backend {
             .ui()
             .map(|window| window.get_minimize_to_tray())
             .unwrap_or(true);
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.minimize_to_tray = minimize;
-            shared.hide_at = None;
-        }
+        // Apply the (unsaved) checkbox immediately, exactly like the old glue
+        // did: the backend reports a login-hide based on this value.
+        self.service
+            .execute(Command::SetMinimizeToTray { enabled: minimize });
         if minimize {
             event_log::record("关闭窗口：按设置最小化到托盘");
             self.hide_to_tray("已最小化到托盘");
@@ -904,995 +182,309 @@ impl Backend {
         minimize
     }
 
-    /// Updates the tray hover text, which stays readable while the window is hidden.
-    fn set_tooltip_text(&self, note: &str) {
-        // Shell tooltips clip a long string without any ellipsis, so the useful
-        // part has to be the front of it.
-        let note: String = note.chars().take(48).collect();
-        let tray = self.tray.clone();
-        let text = format!("DrCom 校园网助手 - {note}");
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(tray) = tray.upgrade() {
-                tray.set_tray_tooltip(text.into());
+    /// Asks the service to log out and shut down. The event loop is not quit here:
+    /// the service sends `Notification::ExitReady` once the logout packet (if any)
+    /// has been sent, and the sink then quits the loop.
+    pub fn quit(&self) {
+        self.service.execute(Command::Shutdown);
+    }
+
+    /// Sends the window to the tray and says so in the tooltip, which is the only
+    /// part of the program still visible once the window is hidden.
+    fn hide_to_tray(&self, note: &str) {
+        request_hide_to_tray(&self.ui, &self.tray, &self.release_requested, note);
+    }
+
+    fn set_status_detail(&self, text: &str) {
+        if let Some(window) = self.ui() {
+            window.set_status_detail(text.into());
+        }
+    }
+
+    /// Wires the window callbacks to service commands. Every callback runs on the
+    /// Slint thread, which is the thread `Service::execute` is called on, as in
+    /// the old in-process glue.
+    fn attach_callbacks(&self, window: &AppWindow) {
+        let connect = self.clone();
+        window.on_connect_requested(move |username, password, auto_reconnect| {
+            connect.service.execute(Command::Login {
+                username: username.to_string(),
+                password: password.to_string(),
+                auto_reconnect,
+            });
+        });
+
+        let disconnect = self.clone();
+        window.on_disconnect_requested(move || {
+            disconnect.service.execute(Command::Logout);
+        });
+
+        let refresh = self.clone();
+        window.on_refresh_requested(move || {
+            refresh.service.execute(Command::RefreshAdapter);
+        });
+
+        let probe = self.clone();
+        window.on_probe_requested(move |kind| {
+            probe.service.execute(Command::Probe {
+                kind: probe_kind(kind),
+            });
+        });
+
+        let network = self.clone();
+        window.on_network_settings_requested(move || {
+            network.service.execute(Command::OpenNetworkEditor);
+        });
+
+        let close_editor = self.clone();
+        window.on_close_network_editor_requested(move || {
+            close_editor.service.execute(Command::CloseNetworkEditor);
+        });
+
+        let system = self.clone();
+        window.on_system_network_requested(move || {
+            if let Err(error) = platform::open_network_settings() {
+                system.set_status_detail(&format!("无法打开网络设置：{error}"));
             }
         });
-    }
 
-    /// Sleeps in short steps, so a stop request is honoured within [`SLEEP_STEP`]
-    /// rather than after the whole delay. Returns `false` once stopping has been
-    /// requested.
-    fn sleep_interruptibly(
-        delay: Duration,
-        stop: &AtomicBool,
-        reconnect_allowed: &AtomicBool,
-    ) -> bool {
-        let mut remaining = delay;
-        while !remaining.is_zero() {
-            if stop.load(Ordering::Relaxed) || !reconnect_allowed.load(Ordering::Relaxed) {
-                return false;
-            }
-            let step = remaining.min(SLEEP_STEP);
-            thread::sleep(step);
-            remaining -= step;
-        }
-        !stop.load(Ordering::Relaxed) && reconnect_allowed.load(Ordering::Relaxed)
-    }
+        let apply = self.clone();
+        window.on_apply_network_requested(move |ip, mask, gateway, dns| {
+            apply.service.execute(Command::ApplyNetwork {
+                ip: ip.to_string(),
+                mask: mask.to_string(),
+                gateway: gateway.to_string(),
+                dns: dns.to_string(),
+            });
+        });
 
-    /// Writes the diagnostics text and the tail of the event log to one file, then
-    /// reveals it in Explorer. Copying to the clipboard covers pasting into a chat;
-    /// a file is what gets attached to a report.
-    fn export_diagnostics(&self) {
-        let Some(window) = self.ui() else {
-            return;
-        };
-        match crate::diagnostics::export(&diagnostics_report(&window, &self.settings)) {
-            Ok(path) => {
-                event_log::record(&format!("导出诊断文件：{}", path.display()));
-                self.set_status(&format!("诊断已导出：{}", path.display()));
-            }
-            Err(error) => self.set_status(&format!("导出诊断失败：{error}")),
-        }
-    }
+        let save = self.clone();
+        window.on_save_requested(
+            move |username, password, auto_login, auto_reconnect, autostart, minimize_to_tray| {
+                save.service.execute(Command::SaveSettings {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                    auto_login,
+                    auto_reconnect,
+                    autostart,
+                    minimize_to_tray,
+                });
+            },
+        );
 
-    fn refresh_adapter(&self, note: Option<&str>) {
-        let selected = adapter::select_for(self.settings.servers_or_env().first().copied());
-        let window = self.ui_weak();
-        let note = note.map(str::to_string);
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(window) = window.upgrade() else {
+        let clear = self.clone();
+        window.on_clear_password_requested(move || {
+            let Some(window) = clear.ui() else {
                 return;
             };
-            match selected {
-                Some(found) => {
-                    show_network_details(&window, &found);
-                    window.set_adapter_name(found.friendly_name.clone().into());
-                    window.set_ipv4_address(found.ipv4.to_string().into());
-                    window.set_mac_address(format_mac(found.mac).into());
-                    window.set_status_detail(
-                        note.unwrap_or_else(|| "网络已就绪，填写账号密码后即可连接".to_string())
-                            .into(),
-                    );
-                }
-                None => {
-                    window.set_adapter_name("未检测到物理网卡".into());
-                    window.set_ipv4_address("--".into());
-                    window.set_mac_address("--".into());
-                    window.set_gateway("--".into());
-                    window.set_dns("--".into());
-                    window.set_ipv6("--".into());
-                    window.set_status_detail(
-                        note.unwrap_or_else(|| {
-                            "没有找到可用的网络连接，请插好网线或连接校园 Wi-Fi 后刷新".to_string()
-                        })
-                        .into(),
-                    );
-                }
-            }
-        });
-    }
-
-    fn stop(&self) {
-        if let Ok(mut shared) = self.shared.lock()
-            && shared.pending_auto.take().is_some()
-        {
-            drop(shared);
-            self.set_connection("未连接", "已取消自动登录");
-            return;
-        }
-        let stop = self
-            .shared
-            .lock()
-            .ok()
-            .and_then(|shared| shared.stop.clone());
-        match stop {
-            Some(stop) => {
-                if let Ok(shared) = self.shared.lock() {
-                    shared.reconnect_allowed.store(false, Ordering::Relaxed);
-                }
-                stop.store(true, Ordering::Relaxed);
-                self.set_connection("断开中", "正在下线…");
-            }
-            None => self.set_status("当前没有进行中的连接"),
-        }
-    }
-
-    fn clear_saved_password(&self) {
-        let Some(window) = self.ui() else {
-            return;
-        };
-        let prefs = cleared_password_preferences(
-            window.get_username().trim().to_string(),
-            window.get_auto_reconnect(),
-            window.get_minimize_to_tray(),
-        );
-        let saved = preferences::path()
-            .and_then(|path| preferences::save(&path, &prefs))
-            .is_ok();
-
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.pending_auto = None;
-            shared.reconnect_allowed.store(false, Ordering::Relaxed);
-        }
-
-        window.set_password("".into());
-        window.set_auto_login(false);
-        window.set_failure_details_expanded(false);
-        if saved {
-            window.set_config_status("已清除此程序保存的密码".into());
-        } else {
-            window.set_config_status("密码已从界面清除，但清除状态未能保存".into());
-        }
-
-        if window.get_connection_state() == "重连中" {
-            window.set_last_failure_retry("已取消重连；不会再使用本次会话凭据".into());
-        }
-        if !self.settings.password.is_empty() {
-            self.set_status(if saved {
-                "此程序保存的密码已清除；drcom.ini 中仍有你配置的密码，本程序不会自动回填或修改它"
-            } else {
-                "界面密码已清空，但清除状态未保存；drcom.ini 仍由你管理，当前不会自动重连"
+            clear.service.execute(Command::ClearSavedPassword {
+                username: window.get_username().trim().to_string(),
+                auto_reconnect: window.get_auto_reconnect(),
+                minimize_to_tray: window.get_minimize_to_tray(),
             });
-        } else if saved {
-            self.set_status("已清除保存的密码；当前 UDP 保活继续运行，连接中断后不会用旧密码重连");
-        } else {
-            self.set_status("界面密码已清空；当前 UDP 保活继续运行，连接中断后不会自动重连");
-        }
-        event_log::record(if saved {
-            "用户清除已保存密码；取消待自动登录并停用后续凭据重连"
-        } else {
-            "用户请求清除已保存密码；保存清除状态失败，取消待自动登录并停用后续凭据重连"
+            // The password is never part of a snapshot, so the form has to be
+            // cleared here; automatic login would otherwise retry with the
+            // credentials the user just asked the backend to forget.
+            window.set_password("".into());
+            window.set_auto_login(false);
+            window.set_failure_details_expanded(false);
         });
-    }
 
-    fn show_session_adapter(&self, found: &adapter::AdapterInfo) {
-        let window = self.ui_weak();
-        let found = found.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
-                show_network_details(&window, &found);
-                window.set_adapter_name(found.friendly_name.into());
-                window.set_ipv4_address(found.ipv4.to_string().into());
-                window.set_mac_address(format_mac(found.mac).into());
-            }
-        });
-    }
-
-    fn start(&self, username: String, password: String, auto_reconnect: bool) {
-        let can_start = self.shared.lock().is_ok_and(|mut shared| {
-            if shared.stop.is_some() || shared.quitting {
-                false
-            } else {
-                shared.pending_auto = None;
-                true
-            }
-        });
-        if !can_start {
-            self.set_status("连接已在进行中");
-            return;
-        }
-        if username.trim().is_empty() || password.is_empty() {
-            self.set_status("请先填写账号和密码");
-            return;
-        }
-        let servers = self.settings.servers_or_env();
-        if servers.is_empty() {
-            // `servers_or_env` falls back to the built-in campus address, so
-            // this branch only fires if that constant is ever emptied.
-            self.remember_failure_text("没有可用的认证服务器地址");
-            self.set_connection("未连接", "没有可用的认证服务器地址");
-            return;
-        }
-        // Resolve the servers first so adapter choice can follow the route the
-        // OS would actually use to reach them.
-        let selected = match self.settings.local_ip {
-            Some(ip) => adapter::list().into_iter().find(|item| item.ipv4 == ip),
-            None => adapter::select_for(servers.first().copied()),
-        };
-        let Some(found) = selected else {
-            self.remember_failure_text("没有找到可用的校园网连接");
-            self.set_connection(
-                "未连接",
-                "没有找到可用的校园网连接，请插好网线或连接校园 Wi-Fi，再点击刷新",
-            );
-            return;
-        };
-
-        let mut config = SessionConfig::new(
-            servers,
-            username.trim().as_bytes().to_vec(),
-            password.into_bytes(),
-        );
-        config.local_ipv4 = found.ipv4;
-        config.mac = found.mac;
-        config.auto_adapter = self.settings.local_ip.is_none();
-        config.interface_index = Some(found.interface_index);
-        config.adapter_mac_override = self.settings.mac;
-        config.hostname = host_name().into_bytes();
-        apply_settings(&mut config, &self.settings);
-        config.allow_loopback_server = false;
-        self.show_session_adapter(&found);
-        // The account never reaches the log; the interface and server are what
-        // make a stale-log entry useful.
-        event_log::record(&format!(
-            "开始认证：网卡 {}（{}，{}），服务器 {}",
-            found.friendly_name,
-            found.description,
-            found.ipv4,
-            config
-                .servers
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let reconnect_allowed = Arc::new(AtomicBool::new(auto_reconnect));
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.stop = Some(Arc::clone(&stop));
-            shared.reconnect_allowed = Arc::clone(&reconnect_allowed);
-            shared.connected_since = None;
-            shared.pending_auto = None;
-        }
-        self.set_connection("连接中", "正在联系校园网服务器…");
-
-        let backend = self.clone_handle();
-        thread::spawn(move || {
-            let mut backoff = ReconnectBackoff::new();
-            let mut first_attempt = true;
-            let mut retry_result = None;
-            loop {
-                // Admission and password clearing share this mutex, so clearing
-                // credentials after the backoff wait is observed before another
-                // session can be constructed with the captured old password.
-                let admitted = backend.shared.lock().is_ok_and(|shared| {
-                    retry_attempt_admitted(
-                        first_attempt,
-                        shared.reconnect_allowed.load(Ordering::Relaxed),
-                        stop.load(Ordering::Relaxed),
-                    )
-                });
-                if !admitted {
-                    let (result, elapsed) = retry_result.take().unwrap_or((
-                        Err(drcom_campus::session::SessionError::Stopped),
-                        Duration::ZERO,
-                    ));
-                    let result = if stop.load(Ordering::Relaxed) {
-                        Err(drcom_campus::session::SessionError::Stopped)
-                    } else {
-                        result
-                    };
-                    backend.finish(result, elapsed);
-                    break;
+        let copy = self.clone();
+        window.on_copy_requested(move || {
+            if let CommandOutcome::Text(report) = copy.service.execute(Command::DiagnosticsText) {
+                match platform::copy(&report) {
+                    Ok(()) => copy.set_status_detail("诊断已复制（不包含账号密码）"),
+                    Err(error) => copy.set_status_detail(&format!("复制失败：{error}")),
                 }
-                first_attempt = false;
+            }
+        });
 
-                let started = Instant::now();
-                let result = match LoginSession::new(config.clone()) {
-                    Ok(mut session) => {
-                        session.use_external_stop(Arc::clone(&stop));
-                        session.run(&mut |event| backend.on_event(event))
+        let export = self.clone();
+        window.on_export_requested(move || {
+            if let CommandOutcome::Text(report) = export.service.execute(Command::DiagnosticsText) {
+                match platform::export(&report) {
+                    Ok(path) => {
+                        event_log::record(&format!("导出诊断文件：{}", path.display()));
+                        export.set_status_detail(&format!("诊断已导出：{}", path.display()));
                     }
-                    Err(error) => Err(error),
-                };
-                let elapsed = started.elapsed();
-                let retry = auto_reconnect
-                    && reconnect_allowed.load(Ordering::Relaxed)
-                    && !stop.load(Ordering::Relaxed)
-                    && result.as_ref().is_err_and(retryable_error);
-                if !retry {
-                    backend.finish(result, elapsed);
-                    break;
+                    Err(error) => export.set_status_detail(&format!("导出诊断失败：{error}")),
                 }
-                // A session that stayed up long enough to count as working starts
-                // the next wait over. Without this rule a link that flaps every
-                // few seconds would keep the delay at its first step forever.
-                if started.elapsed() >= STABLE_SESSION {
-                    backoff.reset();
-                }
-                let delay = backoff.next_delay();
-                let seconds = delay.as_secs();
-                let reason = match &result {
-                    Ok(()) => "会话结束".to_string(),
-                    Err(error) => describe_failure(error),
-                };
-                event_log::record(&format!("连接中断：{reason}；{seconds} 秒后重试"));
-                if let Err(error) = &result {
-                    backend.remember_session_failure(
-                        error,
-                        elapsed,
-                        &format!("将在 {seconds} 秒后重试；本次会复用当前会话凭据"),
-                    );
-                }
-                backend.set_connection("重连中", &format!("{reason}（{seconds} 秒后自动重试）"));
-                backend.set_tooltip_text(&format!("{reason}，{seconds} 秒后重试"));
-                if let Ok(mut shared) = backend.shared.lock() {
-                    shared.connected_since = None;
-                    shared.hide_at = None;
-                }
-                backend.set_online_duration("--");
-                if !Backend::sleep_interruptibly(delay, &stop, &reconnect_allowed) {
-                    if stop.load(Ordering::Relaxed) {
-                        backend.finish(Err(drcom_campus::session::SessionError::Stopped), elapsed);
-                    } else {
-                        backend.finish(result, elapsed);
-                    }
-                    break;
-                }
-                // Automatic sessions discover again inside the session, using
-                // the last successfully authenticated GUID as first candidate.
-                // A manually configured address remains fixed.
-                if let Some(ip) = backend.settings.local_ip {
-                    config.interface_index = adapter::list()
-                        .into_iter()
-                        .find(|found| found.ipv4 == ip)
-                        .map(|found| found.interface_index);
-                }
-                retry_result = Some((result, elapsed));
             }
         });
     }
+}
 
-    fn on_event(&self, event: SessionEvent) {
-        match event {
-            SessionEvent::AdapterSelected(found) => self.show_session_adapter(&found),
-            SessionEvent::Phase(phase) => match phase {
-                SessionPhase::Challenge => self.set_connection("连接中", "正在联系校园网服务器…"),
-                SessionPhase::Authenticating => {
-                    self.set_connection("连接中", "正在检查账号和密码…")
-                }
-                SessionPhase::Online => {
-                    let minimize = if let Ok(mut shared) = self.shared.lock() {
-                        let now = Instant::now();
-                        shared.connected_since = Some(now);
-                        let minimize = shared.minimize_to_tray;
-                        shared.hide_at = minimize.then(|| now + HIDE_AFTER_LOGIN);
-                        minimize
-                    } else {
-                        false
-                    };
-                    event_log::record("登录成功");
-                    self.set_campus_page_status("此程序 UDP 保活已建立");
-                    self.set_connection("已连接", "登录成功，可以使用校园网了");
-                    self.set_online_duration("0 秒");
-                    // The window is about to disappear, so the tray has to carry
-                    // the news as well.
-                    self.set_tooltip_text(if minimize {
-                        "已连接，稍后最小化到托盘"
-                    } else {
-                        "已连接，正在保持在线"
-                    });
-                }
-                SessionPhase::KeepAlive => self.set_connection("已连接", "连接正常，正在保持在线"),
-                SessionPhase::LoggedOut => {
-                    event_log::record("已发送下线报文");
-                    self.set_campus_page_status("此程序 UDP 保活已停止");
-                    self.set_connection("未连接", "已下线");
-                }
-            },
-            // Protocol notes include salts, session tokens and sequence counters.
-            // Keep them out of the everyday UI and shareable diagnostics.
-            SessionEvent::Note(_) => {}
-            SessionEvent::KeepAliveCycle { .. } => {
-                self.set_status("连接正常，正在保持在线");
-                let duration = self
-                    .shared
-                    .lock()
-                    .ok()
-                    .and_then(|shared| shared.connected_since.map(|start| start.elapsed()));
-                if let Some(duration) = duration {
-                    self.set_online_duration(&format_duration(duration));
-                }
-            }
-        }
-    }
-
-    fn set_online_duration(&self, text: &str) {
-        let window = self.ui_weak();
-        let text = text.to_string();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(window) = window.upgrade() {
-                window.set_duration(text.into());
-            }
-        });
-    }
-
-    fn finish(&self, result: Result<(), drcom_campus::session::SessionError>, elapsed: Duration) {
-        let mut quitting = false;
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.stop = None;
-            shared.connected_since = None;
-            shared.hide_at = None;
-            quitting = shared.quitting;
-        }
-        self.set_online_duration("--");
-        let detail = match result {
-            Ok(()) | Err(SessionError::Stopped) => "已下线".to_string(),
-            Err(error) => {
-                let detail = describe_failure(&error);
-                self.remember_session_failure(&error, elapsed, "不会自动重试");
-                if let SessionError::Transport(kind) = &error {
-                    event_log::record(&format!("网络错误类别：{kind:?}"));
-                }
-                detail
-            }
-        };
-        event_log::record(&format!("会话结束：{detail}"));
-        // By now the window is usually in the tray, where the status line is
-        // invisible. Without this the user's only clue is a green dot turning grey.
-        self.set_tooltip_text(&detail);
-        self.set_connection("未连接", &detail);
-        if quitting {
-            let _ = slint::quit_event_loop();
-        }
+/// The Slint probe callback still passes the old integer: 0 = campus only,
+/// 1 = internet only, 2 = both.
+fn probe_kind(kind: i32) -> ProbeKind {
+    match kind {
+        0 => ProbeKind::Campus,
+        1 => ProbeKind::Internet,
+        _ => ProbeKind::All,
     }
 }
 
-/// The text that both 复制诊断 and 导出诊断 produce.
+fn upgrade(ui: &Mutex<slint::Weak<AppWindow>>) -> Option<AppWindow> {
+    match ui.lock() {
+        Ok(slot) => slot.upgrade(),
+        Err(poisoned) => poisoned.into_inner().upgrade(),
+    }
+}
+
+fn seed_form(window: &AppWindow, seed: &FormSeed) {
+    if !seed.username.is_empty() {
+        window.set_username(seed.username.clone().into());
+    }
+    if let Some(password) = &seed.password {
+        window.set_password(password.clone().into());
+    }
+    window.set_auto_login(seed.auto_login);
+    window.set_auto_reconnect(seed.auto_reconnect);
+    window.set_minimize_to_tray(seed.minimize_to_tray);
+    if let Some(enabled) = seed.start_with_windows {
+        window.set_start_with_windows(enabled);
+    }
+    if let Some(status) = &seed.config_status {
+        window.set_config_status(status.clone().into());
+    }
+}
+
+/// Mirrors a service snapshot into the window.
 ///
-/// The account and password are deliberately absent: this is the string a user
-/// pastes into a public issue or hands to a stranger at the network centre. The
-/// tail of the event log is included because "它连不上" is not a report.
-fn diagnostics_report(window: &AppWindow, settings: &ClientConfig) -> String {
-    let recent = event_log::tail(40);
-    let adapters = adapter::list()
-        .into_iter()
-        .map(|item| {
-            format!(
-                "{} / {} / IPv4 {} / 网关 {} / IPv6 {}",
-                item.friendly_name,
-                item.description,
-                item.ipv4,
-                item.details
-                    .gateways
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                item.details
-                    .ipv6
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let local_port = settings
-        .local_port
-        .unwrap_or(drcom_campus::transport::DEFAULT_LOCAL_PORT);
-    format!(
-        "DrCom 校园网助手 {}\n检测结果生成时间：{}\n\n\
-         当前状态：{}\n当前说明：{}\n网页只读状态：{}\n最近一次连接问题：{}\n\
-         错误阶段：{}\n错误码：{}\n发生时间：{}\n本次会话/尝试耗时：{}\n重试安全摘要：{}\n\n\
-         登录使用的网卡：{}\nIPv4：{}\nMAC：{}\n网关：{}\nDNS：{}\nIPv6：{}\n在线时长：{}\n\n\
-         校内（Ping jlu.edu.cn / IPv4）：{}\n外网（HTTPS / IPv4）：{}\n外网（HTTPS / IPv6）：{}\n\
-         外网通过所选校园网网卡直接访问 HTTPS 网站，分别指定 IPv4 / IPv6，不使用应用代理，验证证书与网站响应，主站失败后使用备用站点复核。校内仍使用 Ping，Ping 无回复不等于断网。\n\n\
-         认证服务器：{}\n服务器端口：{}\n本地端口设置：{}\n配置文件：{}\n\n\
-         可用物理网卡：\n{}\n\n本次运行的诊断摘要（仅保存在内存，退出后清空）：\n{}",
-        env!("CARGO_PKG_VERSION"),
-        event_log::timestamp(),
-        window.get_connection_state(),
-        window.get_status_detail(),
-        window.get_campus_page_status(),
-        window.get_last_failure(),
-        window.get_last_failure_stage(),
-        window.get_last_failure_code(),
-        window.get_last_failure_time(),
-        window.get_last_failure_duration(),
-        window.get_last_failure_retry(),
-        window.get_adapter_name(),
-        window.get_ipv4_address(),
-        window.get_mac_address(),
-        window.get_gateway(),
-        window.get_dns(),
-        window.get_ipv6(),
-        window.get_duration(),
-        window.get_campus_result(),
-        window.get_ipv4_result(),
-        window.get_ipv6_result(),
-        settings
-            .servers_or_env()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", "),
-        settings
-            .server_port
-            .unwrap_or(drcom_campus::transport::DEFAULT_SERVER_PORT),
-        if local_port == 0 {
-            "自动选择可用端口".into()
-        } else {
-            format!("固定端口 {local_port}")
-        },
-        drcom_campus::config::discover()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "使用默认设置".into()),
-        adapters,
-        recent
-    )
-}
+/// The login form belongs to the user: state pushes never overwrite username,
+/// password, auto-login, auto-reconnect or 关闭到托盘. Those are seeded once in
+/// [`Backend::bind`]. Everything else here is backend-owned display state.
+fn apply_snapshot(window: &AppWindow, snapshot: &Snapshot) {
+    let connection = &snapshot.connection;
+    window.set_connection_state(connection.state_text.clone().into());
+    window.set_status_detail(connection.detail.clone().into());
+    window.set_online(connection.online);
+    window.set_session_active(connection.session_active);
+    window.set_duration(connection.online_duration.clone().into());
 
-fn show_network_details(window: &AppWindow, found: &adapter::AdapterInfo) {
-    fn addresses(values: &[std::net::IpAddr]) -> slint::SharedString {
-        if values.is_empty() {
-            "--".into()
-        } else {
-            values
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-                .into()
-        }
+    let adapter = &snapshot.adapter;
+    window.set_adapter_name(adapter.name.clone().into());
+    window.set_ipv4_address(adapter.ipv4.clone().into());
+    window.set_mac_address(adapter.mac.clone().into());
+    window.set_gateway(adapter.gateway.clone().into());
+    window.set_dns(adapter.dns.clone().into());
+    window.set_ipv6(adapter.ipv6.clone().into());
+
+    let failure = &snapshot.failure;
+    window.set_last_failure(failure.message.clone().into());
+    window.set_last_failure_time(failure.time.clone().into());
+    window.set_last_failure_stage(failure.stage.clone().into());
+    window.set_last_failure_code(failure.code.clone().into());
+    window.set_last_failure_duration(failure.duration.clone().into());
+    window.set_last_failure_retry(failure.retry.clone().into());
+
+    let probe = &snapshot.probe;
+    window.set_probe_busy(probe.busy);
+    window.set_campus_result(probe.campus.clone().into());
+    window.set_ipv4_result(probe.ipv4.clone().into());
+    window.set_ipv6_result(probe.ipv6.clone().into());
+
+    let editor = &snapshot.network_editor;
+    window.set_network_editor_visible(editor.visible);
+    window.set_network_busy(editor.busy);
+    window.set_edit_adapter_name(editor.adapter_name.clone().into());
+    window.set_edit_ip(editor.ip.clone().into());
+    window.set_edit_mask(editor.mask.clone().into());
+    window.set_edit_gateway(editor.gateway.clone().into());
+    window.set_edit_dns(editor.dns.clone().into());
+    window.set_network_message(editor.message.clone().into());
+
+    window.set_campus_page_status(snapshot.campus_page.clone().into());
+
+    // Persisted startup/config feedback is backend-owned, but only when the
+    // backend actually has an answer.
+    if let Some(status) = &snapshot.settings.config_status {
+        window.set_config_status(status.clone().into());
     }
-    window.set_gateway(addresses(&found.details.gateways));
-    window.set_dns(addresses(&found.details.dns));
-    window.set_ipv6(ipv6_display(&found.details.ipv6));
-}
-
-/// Summarises the adapter's IPv6 addresses down to what the user needs to judge.
-///
-/// Two things are deliberately not shown verbatim. A link-local address is not
-/// routable, and listing `fe80::…` next to a global address makes "IPv6 is
-/// running" indistinguishable from "IPv6 is running but can reach nothing" —
-/// which is exactly the fault users describe as "IPv6 does not work". And an
-/// adapter normally holds several global addresses at once (a stable one plus
-/// RFC 4941 temporary ones), which is noise rather than information, so the
-/// rest are counted.
-fn ipv6_display(values: &[std::net::IpAddr]) -> slint::SharedString {
-    let routable: Vec<String> = values
-        .iter()
-        .filter(|value| !adapter::is_link_local(value))
-        .map(ToString::to_string)
-        .collect();
-    match routable.len() {
-        0 if values.is_empty() => "--".into(),
-        0 => "仅链路本地地址（无法访问 IPv6 互联网）".into(),
-        1 => routable[0].clone().into(),
-        count => format!("{} 等 {count} 个", routable[0]).into(),
+    if let Some(enabled) = snapshot.settings.start_with_windows {
+        window.set_start_with_windows(enabled);
     }
 }
 
-fn apply_settings(config: &mut SessionConfig, settings: &ClientConfig) {
-    if let Some(value) = settings.local_ip {
-        config.local_ipv4 = value;
-    }
-    if let Some(value) = settings.mac {
-        config.mac = value;
-    }
-    if let Some(value) = &settings.hostname {
-        config.hostname = value.as_bytes().to_vec();
-    }
-    if let Some(value) = settings.dns {
-        config.primary_dns = value.octets();
-    }
-    if let Some(value) = settings.dhcp {
-        config.dhcp_server = value.octets();
-    }
-    if let Some(value) = settings.server_port {
-        config.server_port = value;
-    }
-    if let Some(value) = settings.local_port {
-        config.local_port = value;
-    }
-    if let Some(value) = settings.auth_route {
-        config.auth_route = value;
+/// Sets the tray tooltip, records the release request and hides the window.
+/// Runs on the Slint thread.
+fn request_hide_to_tray(
+    ui: &Mutex<slint::Weak<AppWindow>>,
+    tray: &slint::Weak<AppTray>,
+    release_requested: &AtomicBool,
+    note: &str,
+) {
+    set_tray_tooltip(tray, note);
+    // Hiding alone leaves a window whose renderer still believes its buffer holds
+    // a full frame; `main.rs` releases the component on the next timer tick (or
+    // immediately on the next open) so the next window starts from a fresh render
+    // target.
+    release_requested.store(true, Ordering::Relaxed);
+    if let Some(window) = upgrade(ui) {
+        let _ = window.hide();
     }
 }
 
-fn validate_preferences(
-    prefs: &Preferences,
-    servers: Vec<std::net::Ipv4Addr>,
-) -> Result<(), String> {
-    if !prefs.auto_login && prefs.username.is_empty() && prefs.password.is_empty() {
-        return Ok(());
-    }
-    ClientConfig {
-        account: prefs.username.clone(),
-        password: prefs.password.clone(),
-        servers,
-        ..Default::default()
-    }
-    .validate()
-    .map_err(|e| e.to_string())
-}
-
-fn saved_password_for_form(prefs: &Preferences) -> Option<String> {
-    if prefs.password_cleared {
-        Some(String::new())
-    } else if !prefs.username.is_empty() {
-        Some(prefs.password.clone())
-    } else {
-        None
+fn set_tray_tooltip(tray: &slint::Weak<AppTray>, note: &str) {
+    if let Some(tray) = tray.upgrade() {
+        tray.set_tray_tooltip(tray_tooltip_text(note).into());
     }
 }
 
-fn cleared_password_preferences(
-    username: String,
-    auto_reconnect: bool,
-    minimize_to_tray: bool,
-) -> Preferences {
-    Preferences {
-        username,
-        password: String::new(),
-        password_cleared: true,
-        auto_login: false,
-        auto_reconnect,
-        minimize_to_tray,
-    }
-}
-
-/// The failure text, plus a sentence saying what to do when one is known.
-///
-/// `SessionError` already renders Chinese, but "认证服务器未响应：keepalive" leaves the
-/// user with nothing to try. The guidance supplies the "and now what".
-fn describe_failure(error: &SessionError) -> String {
-    let summary = match error {
-        SessionError::Configuration(_) => "认证配置无效".to_string(),
-        SessionError::Challenge(_) => "无法开始登录".to_string(),
-        SessionError::Rejected(failure) => format!("服务器拒绝认证，错误码 {}", failure.code),
-        SessionError::LogoutPacket(_) => "下线请求无法构造".to_string(),
-        SessionError::Route(_) => "无法为认证服务器设置网络路由".to_string(),
-        // These variants contain only a fixed stage name or an ErrorKind.
-        SessionError::Transport(_) | SessionError::NoResponse(_) | SessionError::Credentials(_) => {
-            error.to_string()
-        }
-        SessionError::Stopped => "会话已停止".to_string(),
-    };
-    match error.guidance() {
-        Some(hint) => format!("{summary}｜{hint}"),
-        None => summary,
-    }
-}
-
-fn failure_stage_and_code(error: &SessionError) -> (String, String) {
-    match error {
-        SessionError::Configuration(_) => ("配置".into(), "CONFIGURATION".into()),
-        SessionError::Transport(kind) => ("网络通信".into(), format!("NETWORK-{kind:?}")),
-        SessionError::Challenge(_) => ("挑战".into(), "CHALLENGE".into()),
-        SessionError::Credentials(_) => ("账号格式".into(), "CREDENTIALS".into()),
-        SessionError::Rejected(failure) => ("认证".into(), format!("DRCOM-{}", failure.code)),
-        SessionError::NoResponse(stage) => ((*stage).into(), format!("NO-RESPONSE-{stage}")),
-        SessionError::Stopped => ("停止".into(), "STOPPED".into()),
-        SessionError::LogoutPacket(_) => ("下线".into(), "LOGOUT-PACKET".into()),
-        SessionError::Route(_) => ("网络路由".into(), "ROUTE".into()),
-    }
-}
-
-fn retryable_error(error: &SessionError) -> bool {
-    match error {
-        SessionError::NoResponse(_) => true,
-        SessionError::Transport(kind) => matches!(
-            kind,
-            std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::Interrupted
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::NotConnected
-                | std::io::ErrorKind::AddrNotAvailable
-                | std::io::ErrorKind::NetworkDown
-                | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::HostUnreachable
-        ),
-        _ => false,
-    }
-}
-
-fn format_mac(mac: u64) -> String {
-    mac.to_be_bytes()[2..]
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-/// Reads the settings file, reporting a broken one instead of silently falling
-/// back to defaults.
-fn load_settings() -> Result<ClientConfig, String> {
-    match drcom_campus::config::discover() {
-        Some(path) => drcom_campus::config::load(&path)
-            .map_err(|error| format!("配置文件 {} 未生效：{error}", path.display())),
-        None => Ok(ClientConfig::default()),
-    }
-}
-
-fn host_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "DRCOM-PC".to_string())
-}
-
-fn format_duration(duration: std::time::Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds < 60 {
-        format!("{seconds} 秒")
-    } else if seconds < 3600 {
-        format!("{} 分 {:02} 秒", seconds / 60, seconds % 60)
-    } else {
-        format!("{} 时 {:02} 分", seconds / 3600, (seconds % 3600) / 60)
-    }
+/// The shell clips a tooltip without an ellipsis, so only the front of a long
+/// note survives; keep the prefix out of the budget for the same reason the old
+/// glue truncated before adding it.
+fn tray_tooltip_text(note: &str) -> String {
+    let note: String = note.chars().take(TOOLTIP_NOTE_CHARS).collect();
+    format!("DrCom 校园网助手 - {note}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use drcom_service::ServiceOptions;
 
     #[test]
-    fn automatic_login_requires_valid_saved_credentials() {
-        let servers = vec![std::net::Ipv4Addr::new(10, 100, 61, 3)];
-        assert!(validate_preferences(&Preferences::default(), servers.clone()).is_ok());
-        let mut prefs = Preferences {
-            auto_login: true,
-            ..Default::default()
+    fn probe_kinds_match_the_slint_callback_contract() {
+        assert_eq!(probe_kind(0), ProbeKind::Campus);
+        assert_eq!(probe_kind(1), ProbeKind::Internet);
+        assert_eq!(probe_kind(2), ProbeKind::All);
+        assert_eq!(probe_kind(99), ProbeKind::All);
+    }
+
+    #[test]
+    fn tray_tooltip_keeps_the_prefix_and_only_the_front_of_a_long_note() {
+        assert_eq!(tray_tooltip_text("已连接"), "DrCom 校园网助手 - 已连接");
+        let long = "断".repeat(80);
+        let text = tray_tooltip_text(&long);
+        assert!(text.starts_with("DrCom 校园网助手 - "));
+        let note = text.trim_start_matches("DrCom 校园网助手 - ");
+        assert_eq!(note.chars().count(), TOOLTIP_NOTE_CHARS);
+    }
+
+    #[test]
+    fn state_pushes_leave_the_login_form_alone() {
+        let Ok(window) = AppWindow::new() else {
+            eprintln!("skipped: no windowing backend available to build the component on");
+            return;
         };
-        assert!(validate_preferences(&prefs, servers.clone()).is_err());
-        prefs.username = "test-user".into();
-        prefs.password = "test-pass".into();
-        assert!(validate_preferences(&prefs, servers).is_ok());
-    }
+        window.set_username("typed-user".into());
+        window.set_password("typed-pass".into());
+        window.set_auto_login(true);
+        window.set_auto_reconnect(false);
+        window.set_minimize_to_tray(false);
 
-    #[test]
-    fn external_session_probe_cancels_pending_auto_login_without_starting_our_session() {
-        let mut shared = Shared {
-            page_probe_pending: true,
-            pending_auto: Some((
-                Preferences::default(),
-                Instant::now() + Duration::from_secs(90),
-            )),
-            ..Default::default()
-        };
+        // The skeleton snapshot has different defaults; they must not land on the
+        // form the user is editing.
+        let snapshot = Service::new(ServiceOptions::for_test()).snapshot();
+        apply_snapshot(&window, &snapshot);
 
-        let outcome = reconcile_page_probe_state(&mut shared, CampusPage::CurrentSession);
-
-        assert!(!outcome.app_session_active);
-        assert!(outcome.canceled_auto_login);
-        assert!(!shared.page_probe_pending);
-        assert!(shared.pending_auto.is_none());
-        assert!(shared.stop.is_none());
-        assert_eq!(
-            page_probe_status(CampusPage::CurrentSession, false, outcome),
-            "网页显示已有认证（外部会话）；此程序未建立 UDP 保活"
-        );
-    }
-
-    #[test]
-    fn late_page_probe_preserves_an_active_manual_udp_session() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut shared = Shared {
-            stop: Some(Arc::clone(&stop)),
-            connected_since: Some(Instant::now()),
-            page_probe_pending: true,
-            ..Shared::default()
-        };
-
-        let outcome = reconcile_page_probe_state(&mut shared, CampusPage::CurrentSession);
-
-        assert!(outcome.app_session_active);
-        assert!(!outcome.canceled_auto_login);
-        assert!(!shared.page_probe_pending);
-        assert!(Arc::ptr_eq(shared.stop.as_ref().unwrap(), &stop));
-        assert!(!stop.load(Ordering::Relaxed));
-        assert!(shared.connected_since.is_some());
-        assert_eq!(
-            page_probe_status(CampusPage::CurrentSession, false, outcome),
-            "此程序会话由左上角连接状态和 UDP 保活管理"
-        );
-    }
-
-    #[test]
-    fn login_form_probe_does_not_cancel_pending_auto_login() {
-        let mut shared = Shared::default();
-        let prefs = Preferences {
-            auto_login: true,
-            username: "test-user".into(),
-            password: "test-pass".into(),
-            ..Default::default()
-        };
-        shared.pending_auto = Some((prefs, Instant::now() + Duration::from_secs(90)));
-
-        let outcome = reconcile_page_probe_state(&mut shared, CampusPage::LoginForm);
-
-        assert!(!outcome.app_session_active);
-        assert!(!outcome.canceled_auto_login);
-        assert!(shared.pending_auto.is_some());
-    }
-
-    #[test]
-    fn reconnect_admission_rechecks_clear_between_backoff_and_attempt() {
-        assert!(retry_attempt_admitted(true, false, false));
-        assert!(retry_attempt_admitted(false, true, false));
-        // The reconnect delay completed, then password clearing disabled retries
-        // before the loop could construct the next LoginSession.
-        assert!(!retry_attempt_admitted(false, false, false));
-        assert!(!retry_attempt_admitted(false, true, true));
-        assert!(!retry_attempt_admitted(true, true, true));
-    }
-
-    #[test]
-    fn clearing_password_disables_saved_login_and_overrides_ini_backfill() {
-        let prefs = cleared_password_preferences("test-user".into(), true, false);
-        assert_eq!(prefs.username, "test-user");
-        assert!(prefs.password.is_empty());
-        assert!(!prefs.auto_login);
-        assert!(prefs.password_cleared);
-        assert!(prefs.auto_reconnect);
-        assert!(!prefs.minimize_to_tray);
-        assert_eq!(saved_password_for_form(&prefs).as_deref(), Some(""));
-
-        // A legacy preference file without a username leaves the drcom.ini
-        // password alone; the persisted clear marker overrides it explicitly.
-        assert_eq!(saved_password_for_form(&Preferences::default()), None);
-    }
-
-    #[test]
-    fn exported_failure_summary_does_not_include_server_supplied_text() {
-        let error = SessionError::Rejected(drcom_campus::login_response::LoginFailure {
-            code: 21,
-            ip: None,
-            mac: None,
-            message: Some(b"secret-packet-marker".to_vec()),
-        });
-        let summary = describe_failure(&error);
-        assert!(summary.contains("错误码 21"));
-        assert!(!summary.contains("secret-packet-marker"));
-        assert_eq!(
-            failure_stage_and_code(&error),
-            ("认证".into(), "DRCOM-21".into())
-        );
-    }
-
-    #[test]
-    fn gui_applies_connection_configuration() {
-        let mut session = SessionConfig::new(vec![], vec![], vec![]);
-        // Source port allocation must never change the destination port.
-        assert_eq!(session.server_port, 61440);
-        assert_eq!(session.local_port, 0);
-        let settings = ClientConfig {
-            server_port: Some(6000),
-            local_port: Some(0),
-            dns: Some(std::net::Ipv4Addr::new(1, 1, 1, 1)),
-            hostname: Some("TEST".into()),
-            ..Default::default()
-        };
-        apply_settings(&mut session, &settings);
-        assert_eq!(session.server_port, 6000);
-        assert_eq!(session.local_port, 0);
-        assert_eq!(session.primary_dns, [1, 1, 1, 1]);
-        assert_eq!(session.hostname, b"TEST");
-    }
-
-    #[test]
-    fn reconnect_only_retries_recoverable_network_errors() {
-        assert!(retryable_error(&SessionError::NoResponse("keepalive")));
-        assert!(retryable_error(&SessionError::Transport(
-            std::io::ErrorKind::NetworkDown
-        )));
-        assert!(!retryable_error(&SessionError::Transport(
-            std::io::ErrorKind::AddrInUse
-        )));
-        assert!(!retryable_error(&SessionError::Transport(
-            std::io::ErrorKind::PermissionDenied
-        )));
-        assert!(!retryable_error(&SessionError::Stopped));
-        assert!(!retryable_error(&SessionError::Challenge("invalid reply")));
-    }
-
-    #[test]
-    fn reconnect_delay_doubles_then_holds_at_the_ceiling() {
-        let mut backoff = ReconnectBackoff::new();
-        let seen: Vec<u64> = (0..8).map(|_| backoff.next_delay().as_secs()).collect();
-        assert_eq!(seen[..4], [5, 10, 20, 40], "delay should double each time");
-        assert_eq!(
-            *seen.last().unwrap(),
-            120,
-            "delay should stop at the ceiling"
-        );
-        assert!(
-            seen.windows(2).all(|pair| pair[1] >= pair[0]),
-            "delay must never shrink on its own: {seen:?}"
-        );
-        backoff.reset();
-        assert_eq!(
-            backoff.next_delay().as_secs(),
-            5,
-            "a session that held starts the next wait over"
-        );
-    }
-
-    #[test]
-    fn a_failure_shows_the_advice_next_to_the_reason() {
-        let denied = describe_failure(&SessionError::Transport(
-            std::io::ErrorKind::PermissionDenied,
-        ));
-        assert!(denied.contains("系统保留"));
-        assert!(denied.contains("local_port"));
-        assert!(!denied.contains("管理员"));
-        let text = describe_failure(&SessionError::NoResponse("keepalive"));
-        assert!(
-            text.contains("连接可能已中断"),
-            "the reason must survive: {text}"
-        );
-        assert!(
-            text.contains("网线"),
-            "an unanswered server should suggest checking the cable: {text}"
-        );
-        // A bare server code still needs a useful next step.
-        let rejected = describe_failure(&SessionError::Rejected(
-            drcom_campus::login_response::LoginFailure {
-                code: 2,
-                ip: None,
-                mac: None,
-                message: None,
-            },
-        ));
-        assert!(rejected.contains("账号密码"), "got {rejected}");
-    }
-
-    #[test]
-    fn closing_to_tray_is_on_by_default_like_the_c_sharp_client() {
-        assert!(Shared::default().minimize_to_tray);
-        assert!(Preferences::default().minimize_to_tray);
-    }
-
-    #[test]
-    fn ipv6_display_hides_link_local_addresses_but_says_they_are_all_there_is() {
-        use std::net::{IpAddr, Ipv6Addr};
-
-        let global: IpAddr = "2001:da8:b000:6703:928f:a777:f63e:d0ee".parse().unwrap();
-        let temporary: IpAddr = "2001:da8:b000:6703:8493:26f:45f9:7dfd".parse().unwrap();
-        let link_local: IpAddr = "fe80::60f6:408e:ea0a:8690".parse().unwrap();
-
-        // One routable address: shown as itself.
-        assert_eq!(ipv6_display(&[global, link_local]), global.to_string());
-        // Several: the first identifies the prefix, the rest would be noise.
-        assert_eq!(
-            ipv6_display(&[global, temporary, link_local]),
-            format!("{global} 等 2 个")
-        );
-        // Only link-local is the case that must never look like a working stack.
-        let text = ipv6_display(&[link_local]);
-        assert!(text.contains("仅链路本地"), "got {text}");
-        assert!(
-            text.contains("无法"),
-            "the verdict must be explicit: {text}"
-        );
-        assert_eq!(ipv6_display(&[]), "--");
-        // Guard the exact boundary of fe80::/10, which the bit test could off-by-one.
-        assert!(adapter::is_link_local(
-            &"fe80::1".parse::<Ipv6Addr>().unwrap().into()
-        ));
-        assert!(adapter::is_link_local(
-            &"febf::1".parse::<Ipv6Addr>().unwrap().into()
-        ));
-        assert!(!adapter::is_link_local(
-            &"fec0::1".parse::<Ipv6Addr>().unwrap().into()
-        ));
-        assert!(!adapter::is_link_local(
-            &"2001:da8::1".parse::<Ipv6Addr>().unwrap().into()
-        ));
+        assert_eq!(window.get_username().as_str(), "typed-user");
+        assert_eq!(window.get_password().as_str(), "typed-pass");
+        assert!(window.get_auto_login());
+        assert!(!window.get_auto_reconnect());
+        assert!(!window.get_minimize_to_tray());
+        assert_eq!(window.get_connection_state().as_str(), "未连接");
     }
 }

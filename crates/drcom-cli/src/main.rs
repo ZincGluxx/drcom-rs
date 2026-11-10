@@ -8,6 +8,11 @@
 //!           --local-ip 10.100.61.20 --mac aa:bb:cc:dd:ee:ff
 //! ```
 //!
+//! It is deliberately a direct `drcom-core` frontend and does not link
+//! `drcom-service`: scripts want the raw `SessionEvent` stream (phase changes,
+//! keep-alive sequence and tail) rather than the aggregated display snapshot the
+//! GUI keeps.
+//!
 //! Settings may also come from a `drcom.ini` next to the executable; explicit
 //! flags always win over it. It prints every session event, stops on Enter (or
 //! `q` + Enter) or after `--duration`, and never prints the password.
@@ -24,9 +29,7 @@ use drcom_core::adapter;
 use drcom_core::config;
 use drcom_core::event_log;
 use drcom_core::route::RouteMode;
-use drcom_core::session::{
-    LoginSession, SessionConfig, SessionError, SessionEvent, SessionPhase,
-};
+use drcom_core::session::{LoginSession, SessionConfig, SessionError, SessionEvent, SessionPhase};
 
 const USAGE: &str = "\
 drcom-cli — Dr.COM 校园网命令行认证客户端
@@ -514,4 +517,3 @@ fn format_duration(duration: Option<Duration>) -> String {
         None => "0 秒".to_string(),
     }
 }
-

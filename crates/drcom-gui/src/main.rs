@@ -2,9 +2,9 @@
 
 //! DrCom 校园网助手（Rust 重写）图形入口。
 //!
-//! The authentication engine lives in the library crate; this binary only owns
-//! the Slint window and, in `ui_backend`, the glue that connects the window to a
-//! background session. The headless equivalent is the `drcom-cli` binary.
+//! The application backend lives in `drcom-service`; this binary only owns the
+//! Slint window and, in `ui_backend`, the glue that mirrors service snapshots
+//! into it. The headless equivalents are `drcom-cli` and `drcom-daemon`.
 //!
 //! The window is built on demand and dropped again when the user closes it to the
 //! tray. Slint's software renderer keeps a full-size target — and its backing
@@ -12,9 +12,8 @@
 //! "hide the window but keep it around" path the single largest memory consumer
 //! in this process. The tray, the session and the timer survive on their own.
 
-mod diagnostics;
+mod platform;
 mod single_instance;
-mod static_ipv4;
 mod ui_backend;
 
 slint::include_modules!();
@@ -45,8 +44,11 @@ fn main() -> Result<(), slint::PlatformError> {
         _ => 0,
     };
 
+    // The backend is created once and shared for the life of the process: the
+    // tray outlives every window, and a rebuilt window replays this snapshot.
+    let service = drcom_service::Service::new(drcom_service::ServiceOptions::default());
     let tray = AppTray::new()?;
-    let backend = Rc::new(ui_backend::Backend::new(&tray));
+    let backend = Rc::new(ui_backend::Backend::new(&tray, service));
     // `None` is the normal resting state: a tray-only process with no window and
     // therefore no render target.
     let window: Rc<RefCell<Option<AppWindow>>> = Rc::new(RefCell::new(None));

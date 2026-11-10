@@ -13,6 +13,7 @@
 #define MyAppPublisher "ZincGluxx"
 #define MyAppExeName "drcom-campus.exe"
 #define MyAppCliName "drcom-cli.exe"
+#define MyAppDaemonName "drcom-daemon.exe"
 #define MyAppId "{{5B7E2C41-8A9D-4F3E-B1C6-2D4E7A8F0C93}"
 
 [Setup]
@@ -30,9 +31,9 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ; 安装包图标。与 exe 内嵌的图标同源：都取自 C# 版的
-; DrComCampus\Resources\icon.ico，副本放在 drcom-rs\assets\ 下。
+; DrComCampus\Resources\icon.ico，副本放在 crates\drcom-gui\assets\ 下。
 ; 快捷方式不写 IconFilename，直接用 exe 内嵌图标。
-SetupIconFile=assets\icon.ico
+SetupIconFile=crates\drcom-gui\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
@@ -53,6 +54,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescripti
 [Files]
 Source: "target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "target\release\{#MyAppCliName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "target\release\{#MyAppDaemonName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "drcom.ini.example"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -79,6 +81,8 @@ begin
   Exec(ExpandConstant('{cmd}'), '/C taskkill /IM {#MyAppExeName} /F', '',
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{cmd}'), '/C taskkill /IM {#MyAppCliName} /F', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /IM {#MyAppDaemonName} /F', '',
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 

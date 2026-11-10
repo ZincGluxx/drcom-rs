@@ -64,4 +64,3 @@ fn probe(source: Ipv4Addr, index: u32) -> Result<String, Box<dyn std::error::Err
     }
     Err("no matching challenge within 2s (temporary source port)".into())
 }
-

@@ -4,13 +4,14 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B%20%7C%20edition%202024-DEA584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Slint](https://img.shields.io/badge/UI-Slint-23B0BD?style=flat-square)](https://slint.dev/)
 [![Windows](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?style=flat-square&logo=windows&logoColor=white)]()
-[![Tests](https://img.shields.io/badge/tests-100%20passing-3FB950?style=flat-square)]()
-[![Installer](https://img.shields.io/badge/installer-6.5%20MB-blue?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/tests-156%20passing-3FB950?style=flat-square)]()
+[![Installer](https://img.shields.io/badge/installer-7.0%20MB-blue?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 
 吉林大学（JLU）校园网 Dr.COM 认证客户端的 **Rust + Slint** 重写版。完整实现
-challenge → login → keep-alive → logout 协议流程，已对真实认证服务器长期实测通过；
-同时提供图形界面与命令行两个入口。
+challenge → login → keep-alive → logout 协议流程，已对真实认证服务器长期实测通过。
+仓库已拆分为 Cargo workspace：后端（core / service）与前端分离，自带图形界面与命令行
+两个前端，并提供可被其他程序复用的无界面后端进程。
 
 ![主界面](docs/screenshot.png)
 
@@ -49,9 +50,11 @@ challenge → login → keep-alive → logout 协议流程，已对真实认证�
 - 登录失败显示原因与处理建议；复制或保存检测结果时包含最近失败、网卡与服务器配置。
 - 本地端口默认由系统自动选择，避免端口占用或 Windows 保留范围冲突；服务器端口仍为 61440。
 
-**命令行工具**
+**命令行工具与后端复用**
 
 - `drcom-cli` 把同一套认证引擎带到无桌面环境（脚本、SSH、服务器），默认只显示连接阶段与错误，`--verbose` 可临时打印协议详情。
+- `drcom-daemon` 是无界面后端宿主：通过 JSON-lines 协议（stdio 或回环 TCP）把同一套后端提供给其他语言/进程，协议见 [docs/ipc-protocol.md](docs/ipc-protocol.md)。
+- Rust 程序也可以进程内直接复用 `drcom-service` 的 `Command` / `Snapshot` / `Notification` 契约，见 [docs/frontend-guide.md](docs/frontend-guide.md)。
 
 ## 📊 与 C# 版的资源占用对比
 
@@ -73,24 +76,42 @@ challenge → login → keep-alive → logout 协议流程，已对真实认证�
 ## 🚀 构建与打包
 
 环境准备：[Rust](https://rustup.rs/)（MSVC 工具链）、Windows SDK（`rc.exe`，
-用于编译图标资源；`build.rs` 会自动定位）、[Inno Setup 6](https://jrsoftware.org/isinfo.php)（仅打包需要）。
+用于编译图标资源；GUI 的 `build.rs` 会自动定位）、[Inno Setup 6](https://jrsoftware.org/isinfo.php)（仅打包需要）。
 
 ```bash
-# 运行测试
-cargo test --offline
+# 构建全部产物（GUI / CLI / daemon）
+cargo build --release --workspace --offline
 
-# 构建 GUI 与 CLI
-cargo build --release --offline
+# 只构建某一个包（并行开发时推荐）
+cargo build --release --offline -p drcom-gui
+cargo build --offline -p drcom-cli
+
+# 运行测试（workspace 全部 crate，或单个包）
+cargo test --workspace --offline
+cargo test --offline -p drcom-service
 
 # 静态检查
-cargo clippy --offline --all-targets -- -D warnings
-cargo fmt --check
+cargo clippy --workspace --all-targets --offline -- -D warnings
+cargo fmt --all -- --check
 
-# 制作安装包（产出 DrComRust_v<版本>_Setup.exe）
+# 制作安装包（产出 DrComRust_v<版本>_Setup.exe，包含三个 exe）
 "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" setup.iss
 ```
 
-版本号在三处同步：`Cargo.toml`、`setup.iss` 的 `AppVersion` 与 `VersionInfoVersion`。
+`--offline` 依赖 `Cargo.lock` 固定的版本已经缓存在本机；在全新的联网环境首次构建时可以
+暂时去掉，之后保持离线。
+
+构建产物：
+
+| 路径 | 内容 |
+| --- | --- |
+| `target/release/drcom-campus.exe` | Slint 图形界面 |
+| `target/release/drcom-cli.exe` | 命令行前端 |
+| `target/release/drcom-daemon.exe` | 无界面后端宿主 |
+
+版本号只在一个地方定义：根 `Cargo.toml` 的 `[workspace.package] version`（各 crate 继承）。
+`setup.iss` 的 `MyAppVersion` / `VersionInfoVersion` 需要独立同步，打包前核对两处一致；
+GUI exe 的文件版本资源自动取自 `CARGO_PKG_VERSION`。
 
 ## 🖥 使用
 
@@ -117,30 +138,68 @@ drcom-cli --user 20230001 --pass secret
 - 密码可用环境变量 `DRCOM_PASSWORD` 传入，避免进入命令行历史；任何情况下不回显密码。
 - `--once` 认证成功后立即下线；`--duration 0`（默认）持续保活，按 Enter 或输入 `q` 停止。
 - `--auth-route` / `--auth-route-apply` 查看或应用认证服务器主机路由（后者需管理员）。
+- `--config <文件>` 指定 INI，`--verbose` 打印协议详情，完整参数见 `drcom-cli --help`。
+
+### 无界面后端 `drcom-daemon.exe`
+
+供其他进程/语言复用后端，不是日常使用的入口：在 stdio 或回环 TCP 上按 JSON-lines 收发
+命令与通知；登录命令会携带凭据，因此只应通过 stdio 或回环地址使用，不要暴露到校园网。
+协议、启动参数与示例见 [docs/ipc-protocol.md](docs/ipc-protocol.md)。
 
 ## 🔬 协议实现与测试
 
 - 认证逻辑以社区 B 世代 Python 实现（上游 [drcoms/jlu-drcom-client](https://github.com/drcoms/jlu-drcom-client)
   的 `newclient.py` / `jlu-drcom-py3`）为基准，
-  `src/reference_login.rs` 与之逐字节对应，是本部署实际认证成功的那一套。
+  `crates/drcom-core/src/reference_login.rs` 与之逐字节对应，是本部署实际认证成功的那一套。
 - 登录帧长度随密码长度变化（368 / 370 / 373 / 374 字节），实现按 `password.len()`
-  动态构造，参考向量固化在 `reference/` 下并由测试钉住。
-- `reference/` 同时提供生成 / 校验向量的 Python 脚本，可独立复核协议实现。
+  动态构造，参考向量固化在 `crates/drcom-core/reference/` 下并由测试钉住。
+- `crates/drcom-core/reference/` 同时提供生成 / 校验向量的 Python 脚本，可独立复核协议实现。
 - 测试覆盖：协议帧构造、配置解析（含错误行号提示）、偏好序列化、单实例、
-  图标资源、配色可读性（对比度断言）、UI 后端、网卡切换与挑战回复校验等 100 项。
+  图标资源、配色可读性（对比度断言）、服务状态机、网卡切换与挑战回复校验等；
+  各 crate 的测试随 `cargo test --workspace --offline` 一起运行。
 
-## 📂 目录结构
+## 📂 项目结构
+
+后端与前端已拆成 Cargo workspace（版本在根 `Cargo.toml` 的 `[workspace.package]` 定义）：
 
 ```
 drcom-rs/
-├── src/            # 协议（auth/keepalive/transport）、会话、适配器、诊断、UI 后端
-│   └── bin/        # drcom-cli 命令行入口
-├── ui/             # Slint 界面描述（app.slint）
-├── assets/         # 图标资源（exe 内嵌 + 托盘/窗口）
-├── reference/      # 协议参考向量与 Python 校验脚本
-├── examples/       # UI 预览示例
-└── docs/           # 截图
+├── Cargo.toml                 # workspace 根清单；版本只在这里定义
+├── setup.iss                  # Inno Setup 安装脚本（版本需单独同步）
+├── drcom.ini.example
+├── docs/                      # 截图、发布说明，以及架构 / 前端 / IPC 文档
+└── crates/
+    ├── drcom-core/            # 协议、认证、会话、网卡、配置、凭据、探针（无 UI 依赖）
+    │   ├── reference/         # 协议参考向量与 Python 校验脚本
+    │   └── examples/          # 网卡探测示例
+    ├── drcom-service/         # 前端无关应用层：Command / Snapshot / Notification
+    │   └── src/api.rs         # 冻结的前端契约
+    ├── drcom-ipc/             # JSON-lines 协议
+    ├── drcom-daemon/          # 无界面后端宿主（stdio / 回环 TCP）
+    ├── drcom-gui/             # Slint 桌面窗口、托盘、单实例、剪贴板（drcom-campus.exe）
+    │   ├── ui/app.slint
+    │   ├── assets/
+    │   └── examples/
+    └── drcom-cli/             # 命令行前端（直连 drcom-core）
 ```
+
+依赖方向是 `drcom-core ← drcom-service ← 前端`；各 crate 的职责、旧模块映射与扩展方式见
+[docs/backend-architecture.md](docs/backend-architecture.md)。
+
+## 🧩 复用后端 / 接入其他前端
+
+- **Rust 进程内**：依赖 `crates/drcom-service`，只使用 `Command` / `Snapshot` /
+  `Notification` 契约——订阅、渲染快照、发命令、每秒 `tick`，完整教程与示例见
+  [docs/frontend-guide.md](docs/frontend-guide.md)。
+- **其他语言 / 独立进程**：运行 `drcom-daemon`，通过 stdio 或回环 TCP 上的 JSON-lines
+  收发同样的命令与通知，协议见 [docs/ipc-protocol.md](docs/ipc-protocol.md)。
+- **凭据边界**：`Snapshot` 永不包含密码；Rust 前端用 `form_seed` 初始化表单，其他语言
+  前端在发登录命令时携带凭据，所以 daemon 只能走 stdio 或回环地址。
+- 使用 `drcom-cli` 的脚本需要原始会话事件流，因此它有意直接依赖 `drcom-core`，不经过
+  `drcom-service`。
+
+分层的设计目标、线程与顺序规则、凭据边界与契约版本说明都在
+[docs/backend-architecture.md](docs/backend-architecture.md)。
 
 ## 🔗 相关仓库
 

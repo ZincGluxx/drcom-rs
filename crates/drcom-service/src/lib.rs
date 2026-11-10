@@ -43,12 +43,20 @@
 //! [`Service::tick`] about once per second so durations, the post-login auto-hide
 //! and pending auto-login progress.
 
+// The frozen contract passes a whole `Snapshot` by value in
+// `Notification::State` and `CommandOutcome::Snapshot`: a frontend applies one
+// self-contained state at a time, and boxing it would allocate on every tick and
+// change the IPC schema. The size inequality between those variants and the
+// small ones is therefore intentional, not an oversight.
+#![allow(clippy::large_enum_variant)]
+
 mod api;
 mod service;
+mod text;
 
 pub use api::{
-    API_VERSION, AdapterView, Command, CommandOutcome, ConnectionPhase, ConnectionView, FailureView,
-    FormSeed, NetworkEditorView, Notification, ProbeKind, ProbeView, ServiceOptions, SettingsView,
-    Snapshot,
+    API_VERSION, AdapterView, Command, CommandOutcome, ConnectionPhase, ConnectionView,
+    FailureView, FormSeed, NetworkEditorView, Notification, ProbeKind, ProbeView, ServiceOptions,
+    SettingsView, Snapshot,
 };
 pub use service::{Service, Sink};

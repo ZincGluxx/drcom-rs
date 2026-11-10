@@ -12,10 +12,7 @@ const CAMPUS_HOST: &str = "jlu.edu.cn";
 // an HTTP response; a single successful endpoint establishes reachability.
 const PUBLIC_HOSTS: [&str; 2] = ["www.baidu.com", "www.taobao.com"];
 
-pub fn internet_probe(
-    family: Family,
-    adapter: Option<&crate::adapter::AdapterInfo>,
-) -> String {
+pub fn internet_probe(family: Family, adapter: Option<&crate::adapter::AdapterInfo>) -> String {
     let Some(adapter) = adapter else {
         return "未找到网络连接｜请插好网线或连接校园 Wi-Fi 后重试".into();
     };
@@ -249,4 +246,3 @@ mod tests {
         assert!(ping_result("Request timed out.", target).starts_with("未收到回复"));
     }
 }
-

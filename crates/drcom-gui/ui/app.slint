@@ -128,6 +128,8 @@ export component AppWindow inherits Window {
     callback apply-network-requested(string, string, string, string);
     callback save-requested(string, string, bool, bool, bool, bool);
     callback clear-password-requested();
+    // Dismisses the backend-owned static-IP editor so the next state push cannot reopen it.
+    callback close-network-editor-requested();
 
     ScrollView {
         visible: !root.network-editor-visible;
@@ -288,7 +290,7 @@ export component AppWindow inherits Window {
             Text { text: root.network-message; font-size: 11px; color: Theme.accent; wrap: word-wrap; }
             HorizontalLayout {
                 spacing: 6px;
-                Action { text: "返回"; enabled: !root.network-busy; clicked => { root.network-editor-visible = false; } }
+                Action { text: "返回"; enabled: !root.network-busy; clicked => { root.network-editor-visible = false; root.close-network-editor-requested(); } }
                 Action { text: "Windows 设置"; enabled: !root.network-busy; clicked => { root.system-network-requested(); } }
                 Action { text: root.network-busy ? "应用中…" : "保存网络地址"; primary: true; enabled: !root.network-busy; clicked => { root.apply-network-requested(root.edit-ip, root.edit-mask, root.edit-gateway, root.edit-dns); } }
             }

@@ -1,4 +1,4 @@
-// DrCom 校园网助手（Rust 版） / drcom-campus
+// DrCom 校园网助手（Rust 版） / drcom-core
 // Copyright (C) 2026 ZincGlux
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
@@ -30,16 +30,17 @@
 //!   that non-Rust applications can use the same backend.
 //! * `drcom-gui` / `drcom-cli` — the shipped Slint frontend and the CLI frontend.
 //!
-//! `event_log.rs` mirrors state into a text file under `%LOCALAPPDATA%`, because
-//! the campus network is both the only environment where this program must work
-//! and the one where it cannot be inspected.
+//! `event_log.rs` keeps a bounded, in-memory summary for the explicit
+//! copy/export actions; it never writes a log file, because the diagnostic text
+//! the user chooses to share is the only place this program is meant to leave
+//! evidence behind.
 
 pub mod adapter;
 pub mod auth;
+pub mod config;
 /// Credential-free connectivity probes (Ping / HTTPS) used by the UI and the
 /// diagnostics report. No clipboard or desktop integration lives here.
 pub mod connectivity;
-pub mod config;
 pub mod event_log;
 pub mod keepalive;
 pub mod login_response;
