@@ -1,0 +1,15 @@
+[package]
+name = "drcom-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dr.COM 校园网命令行认证客户端"
+
+[[bin]]
+name = "drcom-cli"
+path = "src/main.rs"
+
+[dependencies]
+drcom-core = { path = "../drcom-core" }

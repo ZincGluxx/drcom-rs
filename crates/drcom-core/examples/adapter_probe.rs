@@ -1,5 +1,5 @@
 //! Credential-free per-interface Dr.COM challenge diagnostic.
-use drcom_campus::{
+use drcom_core::{
     adapter,
     protocol::{ChallengeResponse, challenge_request},
     transport::UdpTransport,
@@ -39,7 +39,7 @@ fn probe(source: Ipv4Addr, index: u32) -> Result<String, Box<dyn std::error::Err
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     let server = SocketAddrV4::new(Ipv4Addr::new(10, 100, 61, 3), 61440);
     let sequence = 2;
-    let nonce = drcom_campus::auth::current_challenge_nonce();
+    let nonce = drcom_core::auth::current_challenge_nonce();
     socket.send(server, &challenge_request(sequence, nonce, 9))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut buffer = [0u8; 2048];
@@ -58,9 +58,10 @@ fn probe(source: Ipv4Addr, index: u32) -> Result<String, Box<dyn std::error::Err
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) || drcom_campus::transport::is_transient_icmp(&e) => {}
+                ) || drcom_core::transport::is_transient_icmp(&e) => {}
             Err(e) => return Err(e.into()),
         }
     }
     Err("no matching challenge within 2s (temporary source port)".into())
 }
+

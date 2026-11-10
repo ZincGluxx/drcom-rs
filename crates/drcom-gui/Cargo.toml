@@ -1,0 +1,35 @@
+[package]
+name = "drcom-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "DrCom 校园网助手（Rust + Slint 桌面前端）"
+build = "build.rs"
+
+[[bin]]
+name = "drcom-campus"
+path = "src/main.rs"
+
+[dependencies]
+slint = { version = "=1.17.1", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-software", "system-tray"] }
+drcom-core = { path = "../drcom-core" }
+drcom-service = { path = "../drcom-service" }
+
+# Not used directly: this exists so that Cargo's feature unification turns on the
+# `png` codec of the `image` crate, which Slint pulls in through `std`
+# (`i-slint-core/image-decoders`) with no format features at all. Without it the
+# window/tray icons loaded from `@image-url` fail to decode at runtime. The
+# obvious alternative, Slint's own `image-default-formats`, also enables
+# `avif`/`exr`, dragging `ravif`/`rav1e` into the build for no benefit.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4"
+
+[build-dependencies]
+slint-build = "=1.17.1"
+
+[dev-dependencies]
+png = "0.18"

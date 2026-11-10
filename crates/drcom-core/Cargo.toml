@@ -1,0 +1,40 @@
+[package]
+name = "drcom-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dr.COM 校园网认证协议、会话与 Windows 网络适配（无界面后端核心）"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+
+# The reference client binds the fixed local port 61440 with SO_REUSEADDR, so
+# `std::net::UdpSocket` is not enough: without reuse the bind fails outright
+# while another Dr.COM component still holds the port.
+socket2 = "0.6"
+
+# Adapter enumeration, DPAPI credential storage, registry autostart and route
+# management are all Win32 calls; the modules that use them are `cfg(windows)`
+# with a non-Windows fallback so the crate still builds (and tests) elsewhere.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    # MultiByteToWideChar, used to turn the GBK text the authentication server
+    # sends back into something a Chinese Windows user can read.
+    "Win32_Globalization",
+    "Win32_Security_Cryptography",
+    "Win32_System_Registry",
+    # GetLocalTime, for local-time stamps in the on-site event log.
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

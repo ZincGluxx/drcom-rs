@@ -1,0 +1,13 @@
+[package]
+name = "drcom-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dr.COM 客户端的 JSON-lines 前端协议：任意语言/进程接入后端服务"
+
+[dependencies]
+drcom-service = { path = "../drcom-service" }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -944,19 +944,61 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
-name = "drcom-campus"
+name = "drcom-cli"
+version = "1.2.1"
+dependencies = [
+ "drcom-core",
+]
+
+[[package]]
+name = "drcom-core"
 version = "1.2.1"
 dependencies = [
  "base64",
- "clipboard-win",
- "image",
- "png",
  "serde",
  "serde_json",
- "slint",
- "slint-build",
  "socket2",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "drcom-daemon"
+version = "1.2.1"
+dependencies = [
+ "drcom-ipc",
+ "drcom-service",
+ "serde_json",
+]
+
+[[package]]
+name = "drcom-gui"
+version = "1.2.1"
+dependencies = [
+ "clipboard-win",
+ "drcom-core",
+ "drcom-service",
+ "image",
+ "png",
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "drcom-ipc"
+version = "1.2.1"
+dependencies = [
+ "drcom-service",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "drcom-service"
+version = "1.2.1"
+dependencies = [
+ "drcom-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

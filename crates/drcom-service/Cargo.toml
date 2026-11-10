@@ -1,0 +1,15 @@
+[package]
+name = "drcom-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dr.COM 校园网客户端的前端无关应用服务：命令、状态快照与通知（无 UI 依赖）"
+
+[dependencies]
+drcom-core = { path = "../drcom-core" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

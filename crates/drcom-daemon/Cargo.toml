@@ -1,0 +1,13 @@
+[package]
+name = "drcom-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dr.COM 无界面后端宿主：通过 JSON-lines（stdio / TCP）向其他前端提供后端能力"
+
+[dependencies]
+drcom-service = { path = "../drcom-service" }
+drcom-ipc = { path = "../drcom-ipc" }
+serde_json = { workspace = true }

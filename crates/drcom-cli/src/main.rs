@@ -20,11 +20,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use drcom_campus::adapter;
-use drcom_campus::config;
-use drcom_campus::event_log;
-use drcom_campus::route::RouteMode;
-use drcom_campus::session::{
+use drcom_core::adapter;
+use drcom_core::config;
+use drcom_core::event_log;
+use drcom_core::route::RouteMode;
+use drcom_core::session::{
     LoginSession, SessionConfig, SessionError, SessionEvent, SessionPhase,
 };
 
@@ -172,7 +172,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut port = file.server_port.unwrap_or(61440);
     let mut local_port = file
         .local_port
-        .unwrap_or(drcom_campus::transport::DEFAULT_LOCAL_PORT);
+        .unwrap_or(drcom_core::transport::DEFAULT_LOCAL_PORT);
     let mut duration = Duration::ZERO;
     let mut once = false;
     let mut quiet = true;
@@ -514,3 +514,4 @@ fn format_duration(duration: Option<Duration>) -> String {
         None => "0 秒".to_string(),
     }
 }
+
