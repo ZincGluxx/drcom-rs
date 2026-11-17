@@ -74,7 +74,9 @@ elif [ -n "$mirror" ]; then
 fi
 # Native GitHub requests are HTTPS; explicit custom local test/mirror URLs may be HTTP.
 temp="$(mktemp -d "${TMPDIR:-/tmp}/drcom-install.XXXXXXXX")"
-[ -n "$temp" ] && [ -d "$temp" ] || fail 'Cannot create temporary directory'
+if [ -z "$temp" ] || [ ! -d "$temp" ]; then
+    fail 'Cannot create temporary directory'
+fi
 trap 'rm -rf -- "$temp"' EXIT
 fetch() { curl -fLsS --connect-timeout 15 --max-time 300 --retry 2 --output "$2" "$1"; }
 printf 'Downloading DrCom Campus v%s (Linux x86_64)\n' "$version"

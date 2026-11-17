@@ -3,10 +3,10 @@
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
-[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {
+if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
     printf 'This wrapper requires Linux x86_64.\n' >&2
     exit 1
-}
+fi
 cd "$root"
 cargo build --locked --release --workspace --bins
 exec python3 scripts/package.py package --target x86_64-unknown-linux-gnu \
