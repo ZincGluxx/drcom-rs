@@ -191,8 +191,13 @@ def macos_package(stage: Path, out: Path, binary_dir: Path, ver: str, target: st
                  str(iconset / f"icon_{size}x{size}{suffix}.png")], stdout=subprocess.DEVNULL)
     run(["iconutil", "-c", "icns", str(iconset), "-o", str(app / "Contents/Resources/AppIcon.icns")])
     # No Developer ID, keychain import or secrets: explicitly ad-hoc, never notarized.
+    # Sign nested helper executables before the app's main executable. codesign
+    # recognizes CFBundleExecutable's path as the containing app and validates
+    # its nested code: Intel binaries start unsigned, unlike arm64 linker's
+    # default ad-hoc signatures. Main-first therefore fails on unsigned helpers.
     for name in BINS:
-        run(["codesign", "--force", "--sign", "-", str(app / "Contents/MacOS" / name)])
+        if name != "drcom-campus":
+            run(["codesign", "--force", "--sign", "-", str(app / "Contents/MacOS" / name)])
     run(["codesign", "--force", "--sign", "-", str(app)])
     run(["codesign", "--verify", "--deep", "--strict", str(app)])
     (volume / "Applications").symlink_to("/Applications", target_is_directory=True)

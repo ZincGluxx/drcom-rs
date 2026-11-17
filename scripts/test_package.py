@@ -84,6 +84,22 @@ class PackageTests(unittest.TestCase):
             for name in package.LEGAL:
                 self.assertTrue((app / "Contents/Resources" / name).is_file())
 
+    def test_macos_signs_unsigned_helpers_before_the_app(self):
+        target = "x86_64-apple-darwin"
+        self.fixture(target)
+        stage = self.root / "stage"
+        out = self.root / "out"
+        stage.mkdir()
+        out.mkdir()
+        with patch.object(package, "run") as native:
+            package.macos_package(stage, out, self.binaries, "1.2.3", target, "abc")
+        commands = [call.args[0] for call in native.call_args_list]
+        signing = [args for args in commands if args[0] == "codesign" and "--sign" in args]
+        self.assertEqual([Path(args[-1]).name for args in signing],
+                         ["drcom-cli", "drcom-daemon", "DrCom Campus.app"])
+        self.assertTrue(any(args[:4] == ["codesign", "--verify", "--deep", "--strict"]
+                            for args in commands))
+
     def test_windows_zip_and_installer_defines_with_spaces(self):
         target = "x86_64-pc-windows-msvc"
         self.fixture(target)
