@@ -72,7 +72,9 @@ export component AppWindow inherits Window {
     min-height: 380px;
     max-width: 480px;
     max-height: 380px;
-    default-font-family: "Microsoft YaHei UI";
+    in-out property <string> ui-font-family;
+    in-out property <bool> tray-available: true;
+    default-font-family: ui-font-family;
     default-font-size: 11px;
     background: Theme.window-background;
     in-out property <string> username;
@@ -199,7 +201,7 @@ export component AppWindow inherits Window {
                             // Deliberately not disabled during a session: the close
                             // button reads this live, so it applies to the running
                             // session exactly as it does in the C# client.
-                            CheckBox { height: 22px; text: "关闭到托盘"; width: 100px; checked <=> root.minimize-to-tray; }
+                            CheckBox { height: 22px; text: root.tray-available ? "关闭到托盘" : "关闭到后台"; width: 100px; checked <=> root.minimize-to-tray; }
                         }
                         Action { text: "保存设置"; enabled: !root.session-active; clicked => { root.save-requested(root.username, root.password, root.auto-login, root.auto-reconnect, root.start-with-windows, root.minimize-to-tray); } }
                         Action { text: "清除已保存密码"; clicked => { root.clear-password-requested(); } }
@@ -291,7 +293,7 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 spacing: 6px;
                 Action { text: "返回"; enabled: !root.network-busy; clicked => { root.network-editor-visible = false; root.close-network-editor-requested(); } }
-                Action { text: "Windows 设置"; enabled: !root.network-busy; clicked => { root.system-network-requested(); } }
+                Action { text: "系统网络设置"; enabled: !root.network-busy; clicked => { root.system-network-requested(); } }
                 Action { text: root.network-busy ? "应用中…" : "保存网络地址"; primary: true; enabled: !root.network-busy; clicked => { root.apply-network-requested(root.edit-ip, root.edit-mask, root.edit-gateway, root.edit-dns); } }
             }
             Rectangle { vertical-stretch: 1; background: transparent; }

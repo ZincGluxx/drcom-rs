@@ -429,9 +429,20 @@ impl Service {
                     shared.remembered = Some(prefs);
                 });
             }
-            Err(_) => {
+            Err(error) => {
+                let non_sensitive = preferences::path()
+                    .and_then(|path| preferences::load_non_sensitive(&path))
+                    .ok();
                 self.with_state(|shared| {
-                    shared.config_status = Some("读取失败，请重新保存账号".to_string());
+                    // A locked/missing keyring must not erase UI preferences or
+                    // trigger auto-login with an empty/stale password.
+                    if let Some(prefs) = non_sensitive {
+                        shared.minimize_to_tray = prefs.minimize_to_tray;
+                        shared.remembered = Some(prefs);
+                    }
+                    shared.config_status = Some(format!(
+                        "凭据未读取：{error}；可手动登录，解锁密钥环后重新保存"
+                    ));
                 });
             }
         }
@@ -872,6 +883,11 @@ impl Service {
     }
 
     fn open_network_editor(&self) {
+        if let Some(reason) = static_ipv4::unsupported_reason() {
+            self.set_status(reason);
+            self.publish();
+            return;
+        }
         let blocked = self
             .with_state(|shared| shared.stop.is_some() || shared.quitting || shared.editor.busy);
         if blocked {

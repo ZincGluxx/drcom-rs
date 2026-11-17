@@ -37,10 +37,8 @@ use crate::route::RouteMode;
 /// File name searched for next to the executable and in the working directory.
 pub const DEFAULT_FILE_NAME: &str = "drcom.ini";
 
-/// Sub-directory of `%APPDATA%` searched after the executable's own directory.
-///
-/// The installer targets Program Files, which an ordinary user cannot write to,
-/// so without this a per-user override would require administrative rights.
+/// Legacy Windows roaming sub-directory, kept for deployed installations.
+/// New cross-platform settings use `preferences::data_directory()` instead.
 pub const APP_DATA_DIR: &str = "DrComCampus";
 
 /// Environment variable that overrides the server list, kept for the GUI's
@@ -298,34 +296,83 @@ pub fn load(path: &Path) -> Result<ClientConfig, LoadError> {
     parse(&text).map_err(LoadError::Invalid)
 }
 
-/// Looks for `drcom.ini` next to the executable, then in the working directory,
-/// then under `%APPDATA%\DrComCampus`.
+/// Looks for `drcom.ini` next to the executable, in the working directory, then
+/// in the per-user platform directory. Windows also checks legacy
+/// `%APPDATA%\\DrComCampus`; Linux also checks origin/linux's
+/// `$XDG_CONFIG_HOME/drcom-campus` (default `~/.config/drcom-campus`).
 ///
-/// The search stops at the first file that exists, so a per-user copy is only
-/// consulted when no machine-wide one is present. Returns `None` when no
-/// candidate exists, which is the normal case for a client driven entirely by
-/// command-line flags.
+/// The existing executable/working-directory precedence is preserved. No files
+/// are created and no configuration is modified by discovery.
 pub fn discover() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
+    discovery_candidates(
+        std::env::current_exe().ok().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+        crate::preferences::user_config_directories(),
+    )
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+fn discovery_candidates(
+    executable: Option<&Path>,
+    working: Option<&Path>,
+    directories: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(directory) = executable.and_then(Path::parent) {
         candidates.push(directory.join(DEFAULT_FILE_NAME));
     }
-    candidates.push(PathBuf::from(DEFAULT_FILE_NAME));
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        candidates.push(
-            PathBuf::from(appdata)
-                .join(APP_DATA_DIR)
-                .join(DEFAULT_FILE_NAME),
-        );
+    candidates.push(
+        working
+            .unwrap_or_else(|| Path::new(""))
+            .join(DEFAULT_FILE_NAME),
+    );
+    for directory in directories {
+        let path = directory.join(DEFAULT_FILE_NAME);
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
     }
-    candidates.into_iter().find(|path| path.is_file())
+    candidates
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_preserves_precedence_and_platform_directories() {
+        let candidates = discovery_candidates(
+            Some(Path::new("/opt/drcom/drcom-campus")),
+            Some(Path::new("/working")),
+            vec![
+                PathBuf::from("/home/u/.config/DrComCampusRust"),
+                PathBuf::from("/home/u/.config/drcom-campus"),
+            ],
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/opt/drcom/drcom.ini"),
+                PathBuf::from("/working/drcom.ini"),
+                PathBuf::from("/home/u/.config/DrComCampusRust/drcom.ini"),
+                PathBuf::from("/home/u/.config/drcom-campus/drcom.ini"),
+            ]
+        );
+        assert_eq!(
+            discovery_candidates(None, None, vec![]),
+            vec![PathBuf::from(DEFAULT_FILE_NAME)]
+        );
+        assert_eq!(
+            discovery_candidates(
+                Some(Path::new("/same/client")),
+                Some(Path::new("/other")),
+                vec![PathBuf::from("/same")]
+            )
+            .len(),
+            2
+        );
+    }
 
     #[test]
     fn reads_the_keys_the_original_client_uses() {

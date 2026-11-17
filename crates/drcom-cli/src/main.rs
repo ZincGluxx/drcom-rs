@@ -47,7 +47,7 @@ drcom-cli — Dr.COM 校园网命令行认证客户端
   --pass <密码>           密码；也可用环境变量 DRCOM_PASSWORD，避免进入命令行历史
   --local-ip <ip>         本机网卡 IPv4；省略时自动检测
   --mac <mac>             网卡 MAC，支持 aa:bb:cc:dd:ee:ff、aabbccddeeff、0xaabbccddeeff
-  --hostname <name>       计算机名，默认取环境变量 COMPUTERNAME
+  --hostname <name>       计算机名，默认读取当前系统主机名
   --dns <ip>              主 DNS，默认 10.10.10.10
   --dhcp <ip>             DHCP 服务器，默认 0.0.0.0
   --port <n>              认证服务器端口，默认 61440
@@ -168,8 +168,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut hostname = file
         .hostname
         .clone()
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_default();
+        .unwrap_or_else(drcom_core::system::host_name);
     let mut dns = file.dns.unwrap_or(Ipv4Addr::new(10, 10, 10, 10));
     let mut dhcp = file.dhcp.unwrap_or(Ipv4Addr::UNSPECIFIED);
     let mut port = file.server_port.unwrap_or(61440);

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DrCom 校园网助手（Rust）
+Name[en]=DrCom Campus
+Comment=Dr.COM campus network authentication client
+Exec=drcom-campus
+Icon=drcom-campus
+Terminal=false
+Categories=Network;
+StartupNotify=false

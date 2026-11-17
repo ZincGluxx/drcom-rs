@@ -59,11 +59,11 @@ impl Clone for Backend {
 
 impl Backend {
     /// Wires the service into the tray and the (yet to be built) window.
-    pub fn new(tray: &AppTray, service: Service) -> Self {
+    pub fn new(tray: Option<&AppTray>, service: Service) -> Self {
         let backend = Self {
             service,
             ui: Arc::new(Mutex::new(slint::Weak::default())),
-            tray: tray.as_weak(),
+            tray: tray.map(|tray| tray.as_weak()).unwrap_or_default(),
             release_requested: Arc::new(AtomicBool::new(false)),
         };
         backend.subscribe();
@@ -109,6 +109,8 @@ impl Backend {
     /// carried went away with it.
     pub fn bind(&self, window: &AppWindow) {
         self.publish(window);
+        window.set_ui_font_family(platform::font_family().into());
+        window.set_tray_available(self.tray.upgrade().is_some());
 
         // The form seed is the one source of a saved password, and it is applied
         // only here. State pushes must not overwrite what the user is typing.
@@ -233,7 +235,11 @@ impl Backend {
 
         let network = self.clone();
         window.on_network_settings_requested(move || {
-            network.service.execute(Command::OpenNetworkEditor);
+            if drcom_core::static_ipv4::is_supported() {
+                network.service.execute(Command::OpenNetworkEditor);
+            } else if let Err(error) = platform::open_network_settings() {
+                network.set_status_detail(&format!("无法打开网络设置：{error}"));
+            }
         });
 
         let close_editor = self.clone();
@@ -415,6 +421,16 @@ fn request_hide_to_tray(
     release_requested: &AtomicBool,
     note: &str,
 ) {
+    // Unix keeps a Dock/taskbar entry: Wayland cannot reliably hide/re-show a
+    // native window, GNOME may have no tray, and Finder reopening an existing
+    // macOS app does not spawn a duplicate executable for the socket guard.
+    // Keep the OS window restorable rather than touching winit's private delegate.
+    if cfg!(unix) || tray.upgrade().is_none() {
+        if let Some(window) = upgrade(ui) {
+            window.window().set_minimized(true);
+        }
+        return;
+    }
     set_tray_tooltip(tray, note);
     // Hiding alone leaves a window whose renderer still believes its buffer holds
     // a full frame; `main.rs` releases the component on the next timer tick (or
@@ -465,10 +481,8 @@ mod tests {
 
     #[test]
     fn state_pushes_leave_the_login_form_alone() {
-        let Ok(window) = AppWindow::new() else {
-            eprintln!("skipped: no windowing backend available to build the component on");
-            return;
-        };
+        i_slint_backend_testing::init_no_event_loop();
+        let window = AppWindow::new().expect("headless Slint component");
         window.set_username("typed-user".into());
         window.set_password("typed-pass".into());
         window.set_auto_login(true);

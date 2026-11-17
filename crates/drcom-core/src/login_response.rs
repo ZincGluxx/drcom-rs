@@ -97,7 +97,18 @@ fn decode_simplified_chinese(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&buffer)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn decode_simplified_chinese(bytes: &[u8]) -> String {
+    // Ported from origin/linux:src/login_response.rs (9735565). Decode the
+    // wire's GBK even on non-Chinese hosts; malformed bytes are replacement
+    // characters, not a platform-dependent locale or an unbounded conversion.
+    encoding_rs::GBK
+        .decode_without_bom_handling(bytes)
+        .0
+        .into_owned()
+}
+
+#[cfg(not(any(windows, unix)))]
 fn decode_simplified_chinese(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -166,6 +177,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn truncated_replies_and_message_padding_are_bounded() {
+        for length in 0..39 {
+            let mut bytes = vec![0; length];
+            if let Some(first) = bytes.first_mut() {
+                *first = 4;
+            }
+            assert_eq!(parse(&bytes), LoginResponse::TooShort);
+        }
+        assert_eq!(trimmed_message(b" \t\r\n"), b"");
+        assert_eq!(trimmed_message(b" \tLDAP \r\n\0ignored"), b"LDAP");
+        #[cfg(unix)]
+        assert!(decode_simplified_chinese(&[0x81]).contains('\u{fffd}'));
+    }
+
+    #[test]
     fn extracts_success_cookie_at_reference_offset() {
         let mut packet = vec![0u8; 39];
         packet[0] = 4;
@@ -230,7 +256,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn the_gbk_reason_the_server_sends_is_decoded_for_display() {
         // `此账号密码错误，请到自助服务平台修改邮箱密码！`, exactly as the deployment
         // sends it: GBK, because the original client is a GBK Windows program.

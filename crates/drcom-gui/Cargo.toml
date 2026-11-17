@@ -28,8 +28,20 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Match the Linux branch: expose the native window for minimize-to-dock when
+# the desktop has no StatusNotifierWatcher. Explicit Linux backends are needed
+# because Slint's default features are disabled above.
+[target.'cfg(target_os = "linux")'.dependencies]
+slint = { version = "=1.17.1", default-features = false, features = ["backend-winit-x11", "backend-winit-wayland", "unstable-winit-030"] }
+
 [build-dependencies]
 slint-build = "=1.17.1"
 
 [dev-dependencies]
 png = "0.18"
+# Thread-local headless backend: CI tests must run assertions rather than skip
+# on macOS (main-thread-only AppKit) or Linux runners without a display.
+i-slint-backend-testing = "=1.17.1"

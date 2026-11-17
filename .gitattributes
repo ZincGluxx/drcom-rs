@@ -1,0 +1,8 @@
+# The same checkout is built on Windows, macOS and Linux runners. In particular,
+# Git Bash and /bin/bash must not receive CRLF shell scripts.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary

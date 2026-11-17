@@ -84,7 +84,44 @@ fn https_probe(host: &str, family: Family, source: IpAddr) -> Result<String, Str
             source,
         )
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        // Ported from origin/linux:src/diagnostics.rs (9735565), but resolve
+        // only trusted system paths, force C locale, null stdin, bound runtime.
+        // TLS peer/hostname validation stays enabled; curlrc and proxies do not.
+        let output = crate::adapter::command::output(
+            "curl",
+            &[
+                "-q",
+                if family == Family::V6 { "-6" } else { "-4" },
+                "--noproxy",
+                "*",
+                "--interface",
+                &source.to_string(),
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                "4",
+                "--silent",
+                "--head",
+                "--output",
+                "/dev/null",
+                "--write-out",
+                "%{http_code} %{remote_ip} %{time_total}",
+                &format!("https://{host}/"),
+            ],
+            std::time::Duration::from_secs(6),
+        )
+        .map_err(|error| format!("系统 HTTPS 检测组件 curl 不可用：{error}"))?;
+        https_result(
+            output.status.code().unwrap_or(-1),
+            &String::from_utf8_lossy(&output.stdout),
+            family,
+            host,
+            source,
+        )
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = (host, family, source);
         Err("当前系统暂不支持 HTTPS 检测".into())
@@ -124,11 +161,12 @@ fn https_result(
     if !(100..600).contains(&status) {
         return Err("未收到有效网站响应".into());
     }
-    let ms = fields
+    let seconds = fields
         .get(2)
         .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(0.0)
-        * 1000.0;
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| "未收到有效检测耗时".to_string())?;
+    let ms = seconds * 1000.0;
     Ok(format!(
         "可用 · {ms:.0} ms｜HTTPS {host}，HTTP {status}，目标 {remote}，源地址 {source}；已验证安全连接和网站响应"
     ))
@@ -175,7 +213,38 @@ fn ping_host(host: &str, family: Family) -> String {
             Err(_) => "无法启动网络检测，请检查系统中的 ping.exe".into(),
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let address = target.to_string();
+        // macOS ping -W is milliseconds, Linux iputils uses seconds. macOS
+        // selects IPv6 with its separate ping6 binary, not ping -6.
+        #[cfg(target_os = "macos")]
+        let (program, args) = if family == Family::V6 {
+            ("ping6", vec!["-n", "-c", "2", "-i", "0.2", &address])
+        } else {
+            ("ping", vec!["-n", "-c", "2", "-W", "1500", &address])
+        };
+        #[cfg(target_os = "linux")]
+        let (program, args) = (
+            "ping",
+            vec![
+                if family == Family::V6 { "-6" } else { "-4" },
+                "-n",
+                "-c",
+                "2",
+                "-W",
+                "2",
+                "-w",
+                "5",
+                &address,
+            ],
+        );
+        match crate::adapter::command::output(program, &args, std::time::Duration::from_secs(6)) {
+            Ok(output) => ping_result(&String::from_utf8_lossy(&output.stdout), target),
+            Err(error) => format!("无法完成 Ping 检测：{error}；不能据此判断登录失败"),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = target;
         "当前系统暂不支持 Ping 检测".into()
@@ -187,10 +256,16 @@ fn ping_result(output: &str, target: IpAddr) -> String {
     // Match ASCII units too: Chinese Windows emits legacy-encoded Chinese,
     // but the reply latency's '=…ms' / '<…ms' and TTL survive decoding.
     let reply = lower.lines().any(|line| {
-        line.contains("ttl=")
-            || (line.contains("ms")
-                && (line.contains('=') || line.contains('<'))
-                && line.contains(&target.to_string()))
+        let from_target = line.split_whitespace().any(|word| {
+            word.trim_end_matches(':')
+                .split('%')
+                .next()
+                .and_then(|value| value.parse::<IpAddr>().ok())
+                == Some(target)
+        });
+        from_target
+            && (line.contains("ttl=")
+                || (line.contains("ms") && (line.contains('=') || line.contains('<'))))
     });
     if reply {
         format!("可以连通（{target}）")
@@ -223,6 +298,44 @@ mod tests {
                 .unwrap_err()
                 .contains("超时")
         );
+    }
+
+    #[test]
+    fn unix_echoes_require_the_actual_target_and_https_time_is_finite() {
+        let target = "10.100.61.3".parse().unwrap();
+        assert!(
+            ping_result(
+                "64 bytes from 10.100.61.3: icmp_seq=1 ttl=55 time=1.23 ms",
+                target
+            )
+            .starts_with("可以连通")
+        );
+        assert!(
+            ping_result(
+                "64 bytes from 10.100.61.30: icmp_seq=1 ttl=55 time=1.23 ms",
+                target
+            )
+            .starts_with("未收到回复")
+        );
+        assert!(
+            ping_result(
+                "From 10.100.61.3 icmp_seq=1 Destination Host Unreachable",
+                target
+            )
+            .starts_with("未收到回复")
+        );
+        for time in ["NaN", "inf", "-1", "bogus"] {
+            assert!(
+                https_result(
+                    0,
+                    &format!("200 1.2.3.4 {time}"),
+                    Family::V4,
+                    "example.com",
+                    target
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,9 @@ pub const DEFAULT_MAC: u64 = 0x8888_8888_8888;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterInfo {
-    /// Windows adapter GUID; unlike IfIndex it survives reboot and DHCP changes.
+    /// Windows GUID or Unix OS interface name (Linux predictable / macOS BSD).
+    /// Independent of DHCP, transient indices and randomized Wi-Fi MACs; an
+    /// interface rename/replacement intentionally invalidates remembered state.
     pub stable_id: String,
     pub friendly_name: String,
     pub description: String,
@@ -100,6 +102,8 @@ pub fn select_for(destination: Option<Ipv4Addr>) -> Option<AdapterInfo> {
 /// Ranking is only a probe order; the session must verify a challenge before login.
 pub fn candidates_for(destination: Option<Ipv4Addr>) -> Vec<AdapterInfo> {
     let preferred_route = destination.and_then(route::best_interface_index);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let preferred_route = preferred_route.or_else(route::default_interface_index);
     let mut adapters = list();
     rank_candidates(
         &mut adapters,
@@ -112,9 +116,13 @@ pub fn candidates_for(destination: Option<Ipv4Addr>) -> Vec<AdapterInfo> {
 fn rank_candidates(adapters: &mut [AdapterInfo], route: Option<u32>, remembered: Option<&str>) {
     adapters.sort_by_key(|adapter| {
         (
-            std::cmp::Reverse(
-                remembered.is_some_and(|id| id.eq_ignore_ascii_case(&adapter.stable_id)),
-            ),
+            std::cmp::Reverse(remembered.is_some_and(|id| {
+                if cfg!(windows) {
+                    id.eq_ignore_ascii_case(&adapter.stable_id)
+                } else {
+                    id == adapter.stable_id
+                }
+            })),
             std::cmp::Reverse(score(adapter, route)),
             adapter.stable_id.clone(),
             adapter.ipv4,
@@ -166,6 +174,7 @@ pub fn list() -> Vec<AdapterInfo> {
 }
 
 /// Descriptions that never carry campus authentication traffic.
+#[cfg(any(windows, test))]
 const VIRTUAL_KEYWORDS: [&str; 24] = [
     "hyper-v",
     "vethernet",
@@ -193,6 +202,7 @@ const VIRTUAL_KEYWORDS: [&str; 24] = [
     "wireguard",
 ];
 
+#[cfg(any(windows, test))]
 fn looks_virtual(friendly_name: &str, description: &str) -> bool {
     let haystack = format!("{friendly_name} {description}").to_lowercase();
     VIRTUAL_KEYWORDS
@@ -427,7 +437,27 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+// Linux implementation and fixtures are ported from origin/linux (9735565).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Run pure Linux fixtures on Windows/macOS too.
+#[path = "adapter/linux.rs"]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(any(unix, test))]
+#[path = "adapter/command.rs"]
+pub(crate) mod command;
+#[cfg(any(target_os = "macos", test))]
+#[path = "adapter/macos_parse.rs"]
+mod macos_parse;
+#[cfg(target_os = "macos")]
+#[path = "adapter/macos.rs"]
+mod platform;
+#[cfg(unix)]
+#[path = "adapter/unix.rs"]
+pub(crate) mod unix;
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod platform {
     use super::AdapterInfo;
 
@@ -457,7 +487,11 @@ mod tests {
             make("other", 1, Ipv4Addr::new(192, 168, 1, 2)),
             make("CAMPUS", 99, Ipv4Addr::new(49, 140, 1, 3)),
         ];
-        rank_candidates(&mut items, Some(1), Some("campus"));
+        rank_candidates(
+            &mut items,
+            Some(1),
+            Some(if cfg!(windows) { "campus" } else { "CAMPUS" }),
+        );
         assert_eq!(items[0].stable_id, "CAMPUS");
         // An unplugged/replaced remembered adapter must not prevent fallback.
         rank_candidates(&mut items, Some(1), Some("missing"));
@@ -591,6 +625,7 @@ mod tests {
             // Reading `IfIndex` out of the header union must agree with the
             // routing APIs, which never use index 0 for a real interface.
             assert_ne!(adapter.interface_index, 0, "{adapter:?}");
+            #[cfg(windows)]
             assert!(!looks_virtual(&adapter.friendly_name, &adapter.description));
         }
     }

@@ -1,4 +1,11 @@
-//! Per-user preferences protected by Windows DPAPI. No plaintext password file.
+//! Per-user preferences. Windows retains its DPAPI blob; macOS/Linux keep only
+//! non-sensitive settings on disk and passwords in Keychain/Secret Service.
+//! There is deliberately no plaintext or in-memory-keyring fallback.
+mod paths;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod secure;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod unix_autostart;
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -37,20 +44,23 @@ impl Default for Preferences {
     }
 }
 
-/// `%LOCALAPPDATA%\DrComCampusRust` — the per-user directory this client owns.
-///
-/// Shared with the event log so that the credentials file and the log sit in one
-/// place, which is what makes "hand me that folder" a usable support request.
+/// User-owned settings/log directory: `%LOCALAPPDATA%\\DrComCampusRust`,
+/// `~/Library/Application Support/DrComCampusRust`, or
+/// `$XDG_CONFIG_HOME/DrComCampusRust` (default `~/.config/DrComCampusRust`).
+/// Environment paths must be absolute; no file is created by this lookup.
 pub fn data_directory() -> io::Result<PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|base| PathBuf::from(base).join("DrComCampusRust"))
-        .ok_or_else(|| io::Error::other("无法定位用户配置目录"))
+    paths::data_directory()
+}
+
+pub(crate) fn user_config_directories() -> Vec<PathBuf> {
+    paths::config_directories()
 }
 
 pub fn path() -> io::Result<PathBuf> {
     Ok(data_directory()?.join("preferences.dat"))
 }
 
+#[cfg(windows)]
 pub fn load(path: &Path) -> io::Result<Preferences> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&crypt(&bytes, false)?).map_err(io::Error::other),
@@ -59,19 +69,87 @@ pub fn load(path: &Path) -> io::Result<Preferences> {
     }
 }
 
+#[cfg(windows)]
 pub fn save(path: &Path, prefs: &Preferences) -> io::Result<()> {
-    use std::io::Write;
     let bytes = crypt(&serde_json::to_vec(prefs).map_err(io::Error::other)?, true)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    atomic_write(path, &bytes)
+}
+
+/// Explicit recovery API: read settings without accessing a failed/locked Unix
+/// keyring. The password is empty and auto-login is disabled. Callers must still
+/// display the original `load` error; this must not masquerade as a full load.
+pub fn load_non_sensitive(path: &Path) -> io::Result<Preferences> {
+    #[cfg(windows)]
+    let mut prefs = load(path)?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let mut prefs = secure::load_non_sensitive(path)?;
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    let mut prefs = Preferences::default();
+    prefs.password.clear();
+    prefs.auto_login = false;
+    Ok(prefs)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn load(path: &Path) -> io::Result<Preferences> {
+    secure::load(path)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn save(path: &Path, prefs: &Preferences) -> io::Result<()> {
+    secure::save(path, prefs)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+pub fn load(_: &Path) -> io::Result<Preferences> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "当前平台不支持安全凭据存储",
+    ))
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+pub fn save(_: &Path, _: &Preferences) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "当前平台不支持安全凭据存储",
+    ))
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        // Do not chmod arbitrary caller-owned parents (e.g. ~/.config or /tmp).
+        // Newly created directories are private on Unix, like origin/linux.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent)?;
     }
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
+    let temporary = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
     let result = (|| {
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         replace(&temporary, path)
@@ -152,13 +230,6 @@ pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn crypt(_: &[u8], _: bool) -> io::Result<Vec<u8>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "凭据保护需要 Windows",
-    ))
-}
-#[cfg(not(windows))]
 pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
@@ -237,16 +308,24 @@ pub mod autostart {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod autostart {
+    pub use super::unix_autostart::{enabled, set};
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub mod autostart {
     use std::io;
     pub fn enabled() -> io::Result<bool> {
-        Ok(false)
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "当前平台不支持开机启动",
+        ))
     }
     pub fn set(_: bool) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "开机启动需要 Windows",
+            "当前平台不支持开机启动",
         ))
     }
 }

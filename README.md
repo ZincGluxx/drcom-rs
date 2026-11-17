@@ -1,11 +1,9 @@
 # DrCom 校园网助手（Rust 版）
 
 [![Release](https://img.shields.io/github/v/release/ZincGluxx/drcom-rs?style=flat-square&color=blue)](https://github.com/ZincGluxx/drcom-rs/releases/latest)
-[![Rust](https://img.shields.io/badge/Rust-1.85%2B%20%7C%20edition%202024-DEA584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.98%20%7C%20edition%202024-DEA584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Slint](https://img.shields.io/badge/UI-Slint-23B0BD?style=flat-square)](https://slint.dev/)
-[![Windows](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?style=flat-square&logo=windows&logoColor=white)]()
-[![Tests](https://img.shields.io/badge/tests-156%20passing-3FB950?style=flat-square)]()
-[![Installer](https://img.shields.io/badge/installer-7.0%20MB-blue?style=flat-square)]()
+[![Platforms](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6?style=flat-square)](docs/platforms.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 
 吉林大学（JLU）校园网 Dr.COM 认证客户端的 **Rust + Slint** 重写版。完整实现
@@ -18,10 +16,11 @@ challenge → login → keep-alive → logout 协议流程，已对真实认证�
 > 同一协议还有一个 C# + Avalonia 实现，见主仓库
 > [drcom-net-client](https://github.com/ZincGluxx/drcom-net-client)。
 
-> **分支说明**：本仓库 `main` / `windows` 分支保留 Windows 版 v1.0.4；
-> **Linux x86_64 移植版（v1.1.0，含静默后台运行与一行安装）在
-> [`linux` 分支](https://github.com/ZincGluxx/drcom-rs/tree/linux)**，
-> 安装教程见该分支的 `docs/install.md`。
+> **分支说明**：`main` / `windows` 保留既有 Windows 发布线，
+> [`linux`](https://github.com/ZincGluxx/drcom-rs/tree/linux) 保留已有 Linux 实现；
+> 本次 macOS 与三端 workspace 集成在独立 `macos` 分支开发，未改写其他分支。
+> Linux 的网卡、路由、静默启动和安装布局复用自 `origin/linux`，不是另起一套客户端。
+> 平台差异与安装说明见 [三端支持说明](docs/platforms.md)。
 
 ## ✨ 特性
 
@@ -31,15 +30,16 @@ challenge → login → keep-alive → logout 协议流程，已对真实认证�
 - 心跳保活自动协商，长时间在线不掉线（实测连续保活 7.5 小时无空档、零失败）。
 - 支持多认证服务器地址依次尝试；可选登录前添加认证服务器 /32 主机路由。
 - 登录前逐网卡验证认证挑战，绑定源 IP 和出接口，并核对服务器地址、端口、序号及 nonce。
-- 登录成功后记住网卡 GUID，重启与重连优先使用；失效后自动探测其他物理网卡。账号密码被拒绝时停止尝试。
+- 登录成功后记住网卡标识（Windows GUID / Unix 接口名），重启与重连优先使用；失效后探测其他物理网卡。账号密码被拒绝时停止尝试。
 
 **界面与系统集成**
 
 - 单窗口紧凑布局：账号设置 + 网络概览 + 一键检测网络，状态一目了然。
-- 跟随 Windows 浅色 / 暗色主题实时切换（切换系统主题无需重启程序）；需要固定配色时
-  用环境变量 `DRCOM_THEME=light`（或 `dark`）覆盖。
-- 关闭窗口最小化到托盘，托盘菜单连接 / 下线 / 退出；单实例保护（重复启动会唤醒已运行实例）。
-- 自动登录、自动重连、开机自启；凭据用 Windows DPAPI 加密保存，不落明文。
+- 跟随平台浅色 / 暗色主题；Linux X11 额外读取 GNOME/KDE 启动时配色，需要固定配色时用 `DRCOM_THEME=light` / `dark`。
+- Windows 关闭到托盘；macOS/Linux 最小化保留可恢复的 Dock/任务栏入口，无托盘的 GNOME 也可使用。重复启动唤出已有实例。
+- 自动登录、重连、登录自启：Windows 注册表、macOS LaunchAgent、Linux XDG autostart。
+- 凭据使用 Windows DPAPI / macOS Keychain / Linux Secret Service；密钥环不可用时明确报错，不明文回退。
+- Windows/Linux 可编辑静态 IPv4（分别使用 UAC/netsh、NetworkManager/polkit）；macOS 打开系统网络设置，不伪装支持应用内编辑。
 
 **诊断能力**
 
@@ -75,43 +75,41 @@ challenge → login → keep-alive → logout 协议流程，已对真实认证�
 
 ## 🚀 构建与打包
 
-环境准备：[Rust](https://rustup.rs/)（MSVC 工具链）、Windows SDK（`rc.exe`，
-用于编译图标资源；GUI 的 `build.rs` 会自动定位）、[Inno Setup 6](https://jrsoftware.org/isinfo.php)（仅打包需要）。
+使用 [Rust](https://rustup.rs/) 1.98（CI 固定 1.98.0），保留 `Cargo.lock`。
+Windows 需 MSVC + Windows SDK，macOS 需 Xcode Command Line Tools；Linux 开发包清单与本机打包步骤见 [BUILDING.md](packaging/BUILDING.md)。
 
 ```bash
-# 构建全部产物（GUI / CLI / daemon）
-cargo build --release --workspace --offline
-
-# 只构建某一个包（并行开发时推荐）
-cargo build --release --offline -p drcom-gui
-cargo build --offline -p drcom-cli
-
-# 运行测试（workspace 全部 crate，或单个包）
-cargo test --workspace --offline
-cargo test --offline -p drcom-service
-
-# 静态检查
-cargo clippy --workspace --all-targets --offline -- -D warnings
+# 构建 GUI / CLI / daemon（macOS/Linux 可执行文件无 .exe 后缀）
+cargo build --locked --release --workspace --bins
+cargo test --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 
-# 制作安装包（产出 DrComRust_v<版本>_Setup.exe，包含三个 exe）
-"C:/Program Files (x86)/Inno Setup 6/ISCC.exe" setup.iss
+# 示例：在 Apple Silicon Mac 上编译并打包
+cargo build --locked --release --workspace --bins --target aarch64-apple-darwin
+python3 scripts/package.py package --target aarch64-apple-darwin
 ```
 
-`--offline` 依赖 `Cargo.lock` 固定的版本已经缓存在本机；在全新的联网环境首次构建时可以
-暂时去掉，之后保持离线。
+版本只改根 `Cargo.toml` 的 `[workspace.package] version`；安装包从它或可执行文件资源取版本，不再手工同步 ISS。
 
-构建产物：
+### GitHub Actions
 
-| 路径 | 内容 |
-| --- | --- |
-| `target/release/drcom-campus.exe` | Slint 图形界面 |
-| `target/release/drcom-cli.exe` | 命令行前端 |
-| `target/release/drcom-daemon.exe` | 无界面后端宿主 |
+[三端流水线](.github/workflows/native.yml) 覆盖四个原生目标：
 
-版本号只在一个地方定义：根 `Cargo.toml` 的 `[workspace.package] version`（各 crate 继承）。
-`setup.iss` 的 `MyAppVersion` / `VersionInfoVersion` 需要独立同步，打包前核对两处一致；
-GUI exe 的文件版本资源自动取自 `CARGO_PKG_VERSION`。
+| 平台 | 构建目标 | 下载包 |
+| --- | --- | --- |
+| Windows x64 | `x86_64-pc-windows-msvc` | 安装 EXE + portable ZIP |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `.app.tar.gz` + DMG |
+| macOS Intel | `x86_64-apple-darwin` | `.app.tar.gz` + DMG |
+| Linux x64 | `x86_64-unknown-linux-gnu` | tar.gz + DEB |
+
+- push/PR：格式、Clippy、原生单元/集成测试与打包脚本测试；推送 `macos` 集成分支还会构建打包四个目标并上传 Artifacts，**不发布 Release**。
+- **Actions → Run workflow**：编译四个目标并上传 Artifacts，**不发布 Release**。
+- 推送 **`v<workspace版本>` 标签**：全部测试与打包成功后发布 8 个主资产、单独校验文件和 `SHA256SUMS`。标签与版本不一致会失败；已有 Release 不覆盖。
+- macOS 目前为 **ad-hoc 签名，未 Developer ID 签名/公证**；Linux tar.gz 是动态链接 portable 包，**不是 AppImage**。
+- 更改代码不等于已执行 GitHub 构建；需将分支推送后在 GitHub 运行。当前版本如已有同名历史标签，应先选择新版本再创建标签，不能覆盖旧发布。
+
+操作细节见 [打包与发布说明](packaging/BUILDING.md)，本地验证范围与尚未执行项见 [验证记录](docs/cross-platform-validation.md)。
 
 ## 🖥 使用
 
@@ -120,9 +118,12 @@ GUI exe 的文件版本资源自动取自 `CARGO_PKG_VERSION`。
 启动后填写账号密码即可连接。可选配置文件 `drcom.ini`（模板见
 [drcom.ini.example](drcom.ini.example)），按以下顺序查找第一个存在的：
 
-1. exe 所在目录
+1. 可执行文件所在目录
 2. 当前工作目录
-3. `%APPDATA%\DrComCampus\`
+3. 平台用户配置目录：Windows `%LOCALAPPDATA%\DrComCampusRust`（兼容旧 `%APPDATA%\DrComCampus`）；macOS `~/Library/Application Support/DrComCampusRust`；Linux `$XDG_CONFIG_HOME/DrComCampusRust`（默认 `~/.config/DrComCampusRust`，兼容旧 `drcom-campus` 目录）。
+
+macOS 应先把 `.app` 移到 Applications 再保存开机启动设置。Linux 无 StatusNotifierWatcher 时关闭到后台会最小化而非隐藏。
+GUI 同时接受 `--tray` / `--silent` / `--background` 静默启动；无托盘时保留最小化的任务栏入口。
 
 全部键均可省略：认证服务器有内置默认值，账号密码可留空由界面输入
 （推荐留空，避免明文落盘）。

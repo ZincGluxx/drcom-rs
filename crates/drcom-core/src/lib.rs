@@ -54,6 +54,7 @@ pub mod route;
 pub mod session;
 /// Validated static IPv4 edits (netsh), executed only after a frontend asks.
 pub mod static_ipv4;
+pub mod system;
 pub mod transport;
 
 #[cfg(test)]

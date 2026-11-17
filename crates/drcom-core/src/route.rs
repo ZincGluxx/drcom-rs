@@ -110,7 +110,7 @@ pub enum RouteError {
     AccessDenied,
     /// The IP Helper call and the `route.exe` fallback both refused.
     Refused(u32),
-    /// Routing information is only available on Windows.
+    /// Unsupported OS or a required system routing tool is unavailable.
     Unsupported,
 }
 
@@ -118,6 +118,12 @@ pub enum RouteError {
 /// reports it. The reference C# client uses the same call to score adapters.
 pub fn best_interface_index(destination: Ipv4Addr) -> Option<u32> {
     platform::best_interface_index(destination)
+}
+
+/// Default IPv4 route selected by the OS, used only as a probe-order hint.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn default_interface_index() -> Option<u32> {
+    platform::default_interface_index()
 }
 
 /// Next hop of the default route installed on `interface_index`.
@@ -404,7 +410,21 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+// Linux implementation and fixtures are ported from origin/linux (9735565).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Run pure Linux fixtures on Windows/macOS too.
+#[path = "route/linux.rs"]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(any(target_os = "macos", test))]
+#[path = "route/macos_parse.rs"]
+mod macos_parse;
+#[cfg(target_os = "macos")]
+#[path = "route/macos.rs"]
+mod platform;
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod platform {
     use super::{Ipv4Addr, RouteAction, RouteError, RoutePlan};
 

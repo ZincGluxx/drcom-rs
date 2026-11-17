@@ -99,7 +99,13 @@ impl fmt::Display for SessionError {
                 "{}",
                 match kind {
                     io::ErrorKind::PermissionDenied =>
-                        "Windows 阻止了客户端使用网络，可能是端口被系统保留或安全软件拦截",
+                        if cfg!(target_os = "linux") {
+                            "系统拒绝绑定所选网卡；请检查 CAP_NET_RAW、路由与防火墙权限，不会退回其他网卡发送凭据"
+                        } else if cfg!(windows) {
+                            "Windows 阻止了客户端使用网络，可能是端口被系统保留或安全软件拦截"
+                        } else {
+                            "系统阻止了客户端使用网络，请检查端口、安全软件或网卡权限"
+                        },
                     io::ErrorKind::AddrNotAvailable => "本机网络地址已变化或不可用",
                     io::ErrorKind::NetworkDown
                     | io::ErrorKind::NetworkUnreachable
@@ -185,9 +191,11 @@ impl SessionError {
                 io::ErrorKind::NetworkDown
                 | io::ErrorKind::NetworkUnreachable
                 | io::ErrorKind::AddrNotAvailable => Some("网卡地址可能已变化，请点“刷新”后重试"),
-                io::ErrorKind::PermissionDenied => Some(
-                    "若配置了固定端口，请将 local_port 改为 0 后重启；若仍失败，请检查安全软件是否允许本程序联网",
-                ),
+                io::ErrorKind::PermissionDenied => Some(if cfg!(target_os = "linux") {
+                    "请只对已验证的 drcom-campus/drcom-cli/drcom-daemon 二进制授予所需 CAP_NET_RAW，勿以 root 运行整个桌面；若配置了固定端口，也可将 local_port 改为 0 后重试"
+                } else {
+                    "若配置了固定端口，请将 local_port 改为 0 后重启；若仍失败，请检查安全软件是否允许本程序联网"
+                }),
                 _ => Some("请先点击“检测网络”，若仍无法登录，可将检测结果交给校园网服务人员"),
             },
             Self::Route(RouteError::AccessDenied) => Some("添加认证服务器路由需要管理员权限"),

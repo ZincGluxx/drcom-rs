@@ -83,24 +83,47 @@ fn local_time() -> LocalTime {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn local_time() -> LocalTime {
-    // Getting local time without a platform call needs a timezone database. This
-    // client only ships for Windows, so the fallback exists only to keep the
-    // module compiling for cross-checks and is deliberately not clever.
+    let mut seconds: libc::time_t = 0;
+    let mut value: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both calls write only to correctly sized local storage;
+    // localtime_r is the thread-safe API and uses the OS timezone database.
+    unsafe { libc::time(&mut seconds) };
+    if unsafe { libc::localtime_r(&seconds, &mut value) }.is_null() {
+        // UTC is preferable to a fabricated 1970 date if local TZ lookup fails.
+        unsafe { libc::gmtime_r(&seconds, &mut value) };
+    }
     LocalTime {
-        year: 1970,
-        month: 1,
-        day: 1,
-        hour: 0,
-        minute: 0,
-        second: 0,
+        year: (value.tm_year + 1900).clamp(0, u16::MAX as i32) as u16,
+        month: (value.tm_mon + 1) as u16,
+        day: value.tm_mday as u16,
+        hour: value.tm_hour as u16,
+        minute: value.tm_min as u16,
+        second: value.tm_sec as u16,
     }
 }
+
+#[cfg(not(any(windows, unix)))]
+compile_error!("event log local time requires Windows or Unix");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_have_real_calendar_values_and_safe_filename_shape() {
+        let stamp = timestamp();
+        assert_eq!(stamp.len(), 19);
+        assert!(!stamp.starts_with("1970-"));
+        let compact = compact_timestamp();
+        assert_eq!(compact.len(), 15);
+        assert!(
+            compact
+                .bytes()
+                .all(|value| value.is_ascii_digit() || value == b'-')
+        );
+    }
 
     #[test]
     fn summaries_are_bounded_and_current_process_only() {

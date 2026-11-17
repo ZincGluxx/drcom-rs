@@ -9,6 +9,12 @@ drcom.ini
 __pycache__/
 *.pyc
 
-# Inno Setup 编译输出
+# Packaging output (contains binaries, archives and temporary staging trees)
+/dist/
 Output/
 *.exe
+
+# Local macOS signing identities/credentials must never be committed
+*.p12
+*.pfx
+*.mobileprovision

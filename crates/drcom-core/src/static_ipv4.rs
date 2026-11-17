@@ -1,6 +1,27 @@
 //! Validated static IPv4 edits, executed only after the user presses Apply.
+//! Linux reuses origin/linux's NetworkManager argument-vector approach, selecting
+//! active profiles by UUID rather than ambiguous connection names. No shell/sudo.
+#[cfg(any(windows, test))]
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::net::Ipv4Addr;
+#[cfg(any(target_os = "linux", test))]
+mod network_manager;
+
+/// Whether this platform implements static IPv4 editing. Linux additionally
+/// requires nmcli at a trusted system location; macOS must hide/disable the UI.
+/// This does not claim permission to apply: UAC/polkit still authorizes changes.
+pub fn is_supported() -> bool {
+    unsupported_reason().is_none()
+}
+
+pub fn unsupported_reason() -> Option<&'static str> {
+    #[cfg(windows)]
+    return None;
+    #[cfg(target_os = "linux")]
+    return network_manager::unavailable_reason();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    Some("当前平台不支持应用内静态 IPv4 设置；请在系统网络设置中配置")
+}
 
 pub struct Configuration {
     address: Ipv4Addr,
@@ -52,6 +73,7 @@ impl Configuration {
         Ok(config)
     }
 
+    #[cfg(any(windows, test))]
     fn script(&self, adapter_name: &str) -> String {
         let adapter = STANDARD.encode(adapter_name.as_bytes());
         format!(
@@ -95,10 +117,16 @@ exit 0"#,
                 _ => Err("网络设置未完成，管理员授权可能已取消".into()),
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            network_manager::apply(self, adapter_name)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = adapter_name;
-            Err("当前平台不支持静态 IPv4 设置".into())
+            Err(unsupported_reason()
+                .unwrap_or("当前平台不支持静态 IPv4 设置")
+                .into())
         }
     }
 }

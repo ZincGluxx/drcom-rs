@@ -68,11 +68,16 @@ impl UdpTransport {
                 return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(index) = interface {
+            crate::adapter::unix::validate_source(index, local_ip)?;
+            pin_unix_interface(&socket, index)?;
+        }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         if interface.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "interface pinning requires Windows",
+                "interface pinning is unsupported on this OS",
             ));
         }
         socket.set_reuse_address(true)?;
@@ -125,9 +130,83 @@ impl UdpTransport {
     }
 }
 
+/// Keep the actual outbound device constrained. Linux kernels may permit the
+/// first SO_BINDTODEVICE on an unprivileged socket; older/security-restricted
+/// kernels need CAP_NET_RAW. Never silently downgrade authentication traffic to
+/// source-only binding (Linux's weak-host routing could use a different NIC).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn pin_unix_interface(socket: &Socket, index: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    let status = unsafe {
+        // IP_BOUND_IF takes the native unsigned interface index, not Windows'
+        // network-byte-order IP_UNICAST_IF value.
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            (&index as *const u32).cast(),
+            std::mem::size_of_val(&index) as libc::socklen_t,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let status = {
+        let name = std::ffi::CString::new(crate::adapter::unix::interface_name(index)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_ptr().cast(),
+                name.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        }
+    };
+    if status == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "cannot safely pin authentication socket to interface {index}: {error}; this OS/security policy requires permission for interface binding; no source-only fallback was used"
+            ),
+        ));
+    }
+    Err(error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn interface_pinning_rejects_unknown_or_unspecified_source() {
+        assert!(UdpTransport::bind_interface(Ipv4Addr::LOCALHOST, 0, Some(0)).is_err());
+        assert!(UdpTransport::bind_interface(Ipv4Addr::LOCALHOST, 0, Some(u32::MAX)).is_err());
+        let name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        let Some(index) = crate::adapter::unix::interface_index(name) else {
+            return;
+        };
+        assert_eq!(
+            UdpTransport::bind_interface(Ipv4Addr::UNSPECIFIED, 0, Some(index))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        match UdpTransport::bind_interface(Ipv4Addr::LOCALHOST, 0, Some(index)) {
+            Ok(socket) => assert!(socket.local_addr().unwrap().ip().is_loopback()),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}"),
+        }
+    }
 
     #[test]
     fn loopback_round_trip_keeps_source_and_packet_boundary() {

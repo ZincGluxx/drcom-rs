@@ -161,7 +161,9 @@ pub struct SettingsView {
     pub auto_reconnect: bool,
     /// "关闭到托盘" option, also used by the automatic hide after a login.
     pub minimize_to_tray: bool,
-    /// `Some` when the autostart registry value could be read.
+    /// Current platform's login-autostart state when it could be read.
+    /// The legacy field name is retained for IPC v1 compatibility; Unix uses
+    /// LaunchAgent/XDG autostart, not the Windows registry.
     pub start_with_windows: Option<bool>,
     /// Save/load feedback (`已记住你的账号`, `保存失败…`), `None` when there is
     /// nothing to say.
@@ -241,7 +243,7 @@ pub enum Command {
         gateway: String,
         dns: String,
     },
-    /// Persist account/startup preferences and the autostart registry value.
+    /// Persist account/startup preferences and the platform login-autostart entry.
     SaveSettings {
         username: String,
         password: String,

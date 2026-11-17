@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 //! DrCom 校园网助手（Rust 重写）图形入口。
 //!
@@ -27,12 +30,29 @@ use std::time::Duration;
 use slint::ComponentHandle;
 
 fn main() -> Result<(), slint::PlatformError> {
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        println!(
+            "DrCom 校园网助手 {}\n用法：drcom-campus [--tray | --silent | --background]\n再次启动会唤出已有实例；DRCOM_THEME=light|dark 可覆盖桌面配色。",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(());
+    }
     // Won before anything else: a second copy must never reach `AppTray::new`,
     // or the notification area ends up with one icon per copy.
     let instance_name = single_instance::app_name();
     let instance = match single_instance::claim(&instance_name) {
         single_instance::Launch::Primary(instance) => instance,
         single_instance::Launch::Duplicate => return Ok(()),
+        #[cfg(unix)]
+        single_instance::Launch::Failed(error) => {
+            return Err(slint::PlatformError::Other(format!(
+                "无法建立单实例保护：{error}"
+            )));
+        }
     };
 
     // The window follows the Windows app theme by default; `DRCOM_THEME` pins it
@@ -41,14 +61,21 @@ fn main() -> Result<(), slint::PlatformError> {
     let scheme_override = match std::env::var("DRCOM_THEME").as_deref() {
         Ok("light") => 1,
         Ok("dark") => 2,
-        _ => 0,
+        _ => platform::scheme_hint().unwrap_or(0),
     };
 
     // The backend is created once and shared for the life of the process: the
     // tray outlives every window, and a rebuilt window replays this snapshot.
     let service = drcom_service::Service::new(drcom_service::ServiceOptions::default());
-    let tray = AppTray::new()?;
-    let backend = Rc::new(ui_backend::Backend::new(&tray, service));
+    let tray = if platform::tray_available() {
+        AppTray::new().ok()
+    } else {
+        None
+    };
+    // Tray support is optional on Linux (stock GNOME has no watcher). A missing
+    // tray must never prevent the window or the authentication backend starting.
+    let tray = tray.filter(|tray| tray.show().is_ok());
+    let backend = Rc::new(ui_backend::Backend::new(tray.as_ref(), service));
     // `None` is the normal resting state: a tray-only process with no window and
     // therefore no render target.
     let window: Rc<RefCell<Option<AppWindow>>> = Rc::new(RefCell::new(None));
@@ -97,6 +124,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let slot = Rc::clone(&window);
         let release = Rc::clone(&release_window);
         let release_after_close = Rc::clone(&release_window_later);
+        let tray_unavailable = tray.is_none();
         Rc::new(move || {
             // Something hid the window and the one-second timer has not picked
             // the request up yet: honour it now, or the window would be taken
@@ -108,6 +136,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 .as_ref()
                 .filter(|window| window.window().is_visible())
             {
+                on_screen.window().set_minimized(false);
                 let _ = on_screen.show();
                 return;
             }
@@ -134,8 +163,12 @@ fn main() -> Result<(), slint::PlatformError> {
             let release = Rc::clone(&release_after_close);
             built.window().on_close_requested(move || {
                 if closing.close_to_tray() {
-                    release();
-                    slint::CloseRequestResponse::HideWindow
+                    if cfg!(unix) || tray_unavailable {
+                        slint::CloseRequestResponse::KeepWindowShown
+                    } else {
+                        release();
+                        slint::CloseRequestResponse::HideWindow
+                    }
                 } else {
                     closing.quit();
                     slint::CloseRequestResponse::KeepWindowShown
@@ -174,23 +207,31 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
-    let tray_open = Rc::clone(&open);
-    tray.on_show_requested(move || tray_open());
-    let quit_backend = Rc::clone(&backend);
-    tray.on_quit_requested(move || quit_backend.quit());
+    if let Some(tray) = &tray {
+        let tray_open = Rc::clone(&open);
+        tray.on_show_requested(move || tray_open());
+        let quit_backend = Rc::clone(&backend);
+        tray.on_quit_requested(move || quit_backend.quit());
+    }
 
     let activate_request = Arc::clone(&show_request);
     instance.listen(move || activate_request.store(true, Ordering::Relaxed));
 
-    tray.show()?;
-    // `--tray` (used by the autostart entry, and handy on its own) starts in the
-    // notification area without paying for a window nobody asked for.
-    let start_hidden = std::env::args().any(|arg| arg == "--tray")
-        || matches!(std::env::var("DRCOM_START_HIDDEN").as_deref(), Ok("1"));
-    if !start_hidden {
+    // Accept the Linux branch's silent-start aliases as well as --tray.
+    let start_hidden = arguments
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--tray" | "--silent" | "--background" | "-s"))
+        || matches!(std::env::var("DRCOM_START_HIDDEN").as_deref(), Ok("1"))
+        || std::env::var("DRCOM_SILENT").is_ok_and(|value| !value.is_empty() && value != "0");
+    // Unix retains a native Dock/taskbar window so activation does not depend on
+    // a new executable launch (Finder may send AppKit Reopen instead).
+    if !start_hidden || tray.is_none() || cfg!(unix) {
         open();
+        if start_hidden && let Some(window) = window.borrow().as_ref() {
+            window.window().set_minimized(true);
+        }
     }
-    slint::run_event_loop()
+    slint::run_event_loop_until_quit()
 }
 
 #[cfg(test)]
@@ -230,10 +271,8 @@ mod theme_tests {
 
     #[test]
     fn both_colour_schemes_keep_the_text_readable() {
-        let Ok(app) = AppWindow::new() else {
-            eprintln!("skipped: no windowing backend available to build the component on");
-            return;
-        };
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().expect("headless Slint component");
         let theme = app.global::<Theme>();
         let mut surfaces = Vec::new();
         for (scheme, name) in [(1, "light"), (2, "dark")] {
@@ -292,6 +331,7 @@ mod icon_tests {
 
     #[test]
     fn the_slint_icons_decode_with_the_formats_enabled_for_this_build() {
+        i_slint_backend_testing::init_no_event_loop();
         for (name, expected) in [("icon-32.png", 32), ("icon-128.png", 128)] {
             let path = asset(name);
             let image = slint::Image::load_from_path(&path)

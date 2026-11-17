@@ -337,9 +337,7 @@ pub(crate) fn cleared_password_preferences(
 }
 
 pub(crate) fn host_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "DRCOM-PC".to_string())
+    drcom_core::system::host_name()
 }
 
 /// Reads the settings file, reporting a broken one instead of silently falling
@@ -494,7 +492,13 @@ mod tests {
         let denied = describe_failure(&SessionError::Transport(
             std::io::ErrorKind::PermissionDenied,
         ));
-        assert!(denied.contains("系统保留"));
+        if cfg!(windows) {
+            assert!(denied.contains("系统保留"));
+        } else if cfg!(target_os = "linux") {
+            assert!(denied.contains("CAP_NET_RAW"));
+        } else {
+            assert!(denied.contains("系统阻止"));
+        }
         assert!(denied.contains("local_port"));
         assert!(!denied.contains("管理员"));
         let text = describe_failure(&SessionError::NoResponse("keepalive"));

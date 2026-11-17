@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Dr.COM 校园网认证协议、会话与 Windows 网络适配（无界面后端核心）"
+description = "Dr.COM 校园网认证协议、会话与跨平台网络适配（无界面后端核心）"
 
 [dependencies]
 serde = { workspace = true }
@@ -17,9 +17,7 @@ base64 = { workspace = true }
 # while another Dr.COM component still holds the port.
 socket2 = "0.6"
 
-# Adapter enumeration, DPAPI credential storage, registry autostart and route
-# management are all Win32 calls; the modules that use them are `cfg(windows)`
-# with a non-Windows fallback so the crate still builds (and tests) elsewhere.
+# Native platform services; Windows retains DPAPI and the IP Helper APIs.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
@@ -35,6 +33,16 @@ windows-sys = { version = "0.52", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+encoding_rs = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

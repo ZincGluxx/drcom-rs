@@ -8,8 +8,31 @@
 ; 与 C# 版 (setup.iss) 使用不同的 AppId 和安装目录，两者可以共存；
 ; 本地 UDP 端口默认自动分配；校园网账号仍可能限制同时在线的设备数。
 
+; CI passes /DMyAppVersion, /DMyAppFileVersion, /DBinaryDir, /DPackageDir,
+; /DOutputPath and /DOutputName. Plain `ISCC setup.iss` still uses target/release;
+; its version comes from the GUI executable's Cargo-generated version resource.
+#ifndef BinaryDir
+  #define BinaryDir SourcePath + "target\release"
+#endif
+#ifndef PackageDir
+  #define PackageDir SourcePath
+#endif
+#ifndef MyAppVersion
+  #define MyAppVersion GetFileProductVersion(BinaryDir + "\drcom-campus.exe")
+#endif
+#if MyAppVersion == ""
+  #error "Missing GUI version resource. Build release first, or pass /DMyAppVersion."
+#endif
+#ifndef MyAppFileVersion
+  #define MyAppFileVersion GetVersionNumbersString(BinaryDir + "\drcom-campus.exe")
+#endif
+#ifndef OutputPath
+  #define OutputPath SourcePath + "dist"
+#endif
+#ifndef OutputName
+  #define OutputName "drcom-campus-windows-x86_64-v" + MyAppVersion + "-setup"
+#endif
 #define MyAppName "DrCom 校园网助手 (Rust)"
-#define MyAppVersion "1.2.1"
 #define MyAppPublisher "ZincGluxx"
 #define MyAppExeName "drcom-campus.exe"
 #define MyAppCliName "drcom-cli.exe"
@@ -24,8 +47,10 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-OutputDir=..
-OutputBaseFilename=DrComRust_v{#MyAppVersion}_Setup
+OutputDir={#OutputPath}
+OutputBaseFilename={#OutputName}
+LicenseFile={#PackageDir}\LICENSE
+AppPublisherURL=https://github.com/ZincGluxx/drcom-rs
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -33,8 +58,9 @@ PrivilegesRequired=admin
 ; 安装包图标。与 exe 内嵌的图标同源：都取自 C# 版的
 ; DrComCampus\Resources\icon.ico，副本放在 crates\drcom-gui\assets\ 下。
 ; 快捷方式不写 IconFilename，直接用 exe 内嵌图标。
-SetupIconFile=crates\drcom-gui\assets\icon.ico
+SetupIconFile={#SourcePath}crates\drcom-gui\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
 RestartApplications=no
@@ -43,7 +69,7 @@ VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 ; Inno 不会从 AppVersion 推导文件版本，缺了这一项时 Setup.exe 的「文件版本」
 ; 是空的、资源区里是 0.0.0.0 —— 只有产品版本有值，属性页看起来像坏掉的构建。
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyAppFileVersion}
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Default.isl"
@@ -52,10 +78,16 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加选项："
 
 [Files]
-Source: "target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "target\release\{#MyAppCliName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "target\release\{#MyAppDaemonName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "drcom.ini.example"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinaryDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinaryDir}\{#MyAppCliName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinaryDir}\{#MyAppDaemonName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PackageDir}\drcom.ini.example"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PackageDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PackageDir}\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PackageDir}\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+; Optional for direct local ISCC; generated staging metadata is always present in CI.
+Source: "{#PackageDir}\BUILD-INFO.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#PackageDir}\RELEASE-NOTES.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
