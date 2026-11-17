@@ -1,4 +1,4 @@
-# 三端集成本地验证记录
+# 三端集成与原生 CI 验证记录
 
 日期：2026-11-17；开发分支：`macos`；基线：workspace `e207997`。
 
@@ -24,13 +24,31 @@
 - 已下载上述两个目标的四个主资产，逐个 SHA256 校验通过；核验 `.app` 内 Mach-O 架构、三个可执行文件权限、Info.plist、签名资源与 BUILD-INFO 的源提交，Windows CI 的 CLI/daemon `--help` 本机执行通过。
 - Linux：原生 Clippy 与 195 项测试通过，ShellCheck 0.8 在两处 `A && B || C` 写法报 SC2015，尚未到安装/打包。修复提交 `8f2b8b6` 改为明确 `if`，不抑制诊断。
 - macOS Intel：原生 Clippy、195 项测试与 release 构建成功；打包时 codesign 主程序先于未签名辅助程序导致失败。改为先签 CLI/daemon，再签整个 App，并新增签名顺序回归测试。Apple Silicon 因链接器默认 ad-hoc 签名未暴露此顺序问题。
-- 后续修复运行结果将于完整验证后补充。
+
+## 修复后原生 CI：四个目标全部成功
+
+提交：`60810d6f6b25b478298d9306c164bd080a9ca035`。
+运行：[Native CI #44097011011](https://github.com/ZincGluxx/drcom-rs/actions/runs/44097011011)，结论 **success**。
+
+| 目标 | 原生验证 | 打包资产 |
+| --- | --- | --- |
+| Windows x64 | fmt / Clippy / 195 tests / release / CLI-daemon help | 安装 EXE + portable ZIP |
+| macOS arm64 | fmt / Clippy / 195 tests / release / codesign strict / hdiutil verify | `.app.tar.gz` + DMG |
+| macOS x64 | fmt / Clippy / 195 tests / release / codesign strict / hdiutil verify | `.app.tar.gz` + DMG |
+| Linux x64 | fmt / Clippy / 195 tests / ShellCheck / 隔离 HOME 安装升级卸载 / release | tar.gz + DEB |
+
+- 每个目标的 Python 包测试 **9/9**，增加 Intel 未签名辅助程序必须先于 App 签名的回归断言。
+- Linux 安装集成实测：含空格路径安装全部三个程序、自启项保留、升级不重新启用禁用项、卸载保留账号、篡改/缺少 SHA256 都硬失败。
+- Linux 真实 `dpkg-shlibdeps` 推导出的最低 glibc 为 **2.35**；`dpkg-deb --build/--info` 和 `desktop-file-validate` 成功。不是静态包或 AppImage。
+- macOS 两种架构都成功执行本机 `codesign --verify --deep --strict` 和 `hdiutil verify`，但仍只是 ad-hoc 签名，未公证。
+- 已下载本轮全部 8 个主资产和 8 个单独校验文件，用打包脚本的 exact-release verifier 核验资产集合与每个 SHA256，生成聚合 `SHA256SUMS`；额外验证 `.app` Mach-O 架构/可执行权限/Info.plist/签名资源、Linux tar 的 ELF 架构与权限、BUILD-INFO 源提交。
+- Artifacts 在上述 run 页面，名称为 `packages-<target>`，保留 14 天。Release job 按预期 **skipped**；没有创建标签或发布。
 
 ## 未执行，不能据此宣称通过
 
 - 未创建版本标签或 GitHub Release。
 - 未在本机 Mac 安装 DMG、打开 GUI 或验证 Gatekeeper。
-- Linux dpkg、隔离 HOME 安装集成测试、GUI 尚待后续 native runner 验证。
+- 未在真实 Linux 桌面安装 DEB、启动 GUI 或对真实用户账号做操作（CI 已运行 dpkg 构建检查及隔离 HOME 安装测试）。
 - 未操作真实 Keychain/Secret Service、真实自启项、实际修改网卡/路由。
 - 未用真实校园网账号做三端认证、断线恢复或长时保活。
 
@@ -41,4 +59,4 @@
 - Linux 升级不自动重新开启用户禁用的登录启动项。
 - macOS/Linux 保留最小化原生窗口；不替换、不注入、不 swizzle winit 的内部 AppKit delegate。macOS Cmd-Q / Dock Quit 不保证走服务下线，应按 [平台说明](platforms.md) 使用菜单栏图标“退出程序”。
 
-源代码和 CI 已准备好，原生 runner 成功及校园网实测是后续发布验收，不应把静态编译检查描述成原生测试结果。
+四个原生 runner 已验证构建、测试和打包成功。三端桌面交互、真实密钥环与校园网认证/长时保活仍是后续发布验收，不应把原生 CI 打包成功描述为真实校园网实测成功。
